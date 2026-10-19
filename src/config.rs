@@ -13,6 +13,8 @@ pub const FEED_TARGET: usize = 42;
 pub const FEED_MAX_PAGES: usize = 12;
 /// 回答列表每页条数
 pub const ANSWERS_PAGE: usize = 20;
+/// 评论每页条数
+pub const COMMENTS_PAGE: usize = 20;
 /// 阅读流硬上限
 pub const STREAM_MAX: usize = 50;
 

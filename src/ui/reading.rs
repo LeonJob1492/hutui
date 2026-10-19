@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::text;
 use crate::ui::theme;
-use crate::zhihu::AnswerItem;
+use crate::zhihu::{AnswerItem, AnswerMeta, Vote};
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span, Text};
@@ -11,7 +11,13 @@ use ratatui::Frame;
 /// 把**当前这一条**回答摊平成行。
 ///
 /// 阅读视图是「一条一屏」：↑↓ 换回答，条内滚动靠 PgUp/PgDn。
-pub fn build(item: &AnswerItem, index: usize, total: usize, width: u16) -> Vec<Line<'static>> {
+pub fn build(
+    item: &AnswerItem,
+    index: usize,
+    total: usize,
+    meta: Option<&AnswerMeta>,
+    width: u16,
+) -> Vec<Line<'static>> {
     let w = (width as usize).saturating_sub(2).max(20);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
@@ -20,13 +26,21 @@ pub fn build(item: &AnswerItem, index: usize, total: usize, width: u16) -> Vec<L
     } else {
         item.author.clone()
     };
-    let head = format!(
-        " {}/{}  ·  {}  ·  {} 赞 ",
-        index + 1,
-        total,
-        author,
-        text::compact_num(item.voteup)
-    );
+    let count = meta.map(|m| m.voteup).filter(|c| *c > 0).unwrap_or(item.voteup);
+
+    let mut tail = format!("{author}  ·  {} 赞", text::compact_num(count));
+    if let Some(m) = meta {
+        if m.vote == Vote::Up {
+            tail.push_str("  ✓");
+        } else if m.vote == Vote::Down {
+            tail.push_str("  ✗");
+        }
+        if m.faved {
+            tail.push_str("  ·  已收藏");
+        }
+    }
+
+    let head = format!(" {}/{}  ·  {tail} ", index + 1, total);
     let dashes = w.saturating_sub(text::width(&head) + 2).max(2);
     lines.push(Line::from(Span::styled(
         format!("──{}{}", head, "─".repeat(dashes)),

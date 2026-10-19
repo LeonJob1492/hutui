@@ -1,3 +1,4 @@
+pub mod comments;
 pub mod list;
 pub mod panic;
 pub mod reading;
@@ -38,6 +39,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     match app.view {
         View::List => list::draw(f, app, rows[1]),
         View::Reading => reading::draw(f, app, rows[1]),
+        View::Comments => comments::draw(f, app, rows[1]),
         View::Panic => {}
     }
     footer(f, app, rows[2]);
@@ -77,6 +79,7 @@ fn header(f: &mut Frame, app: &App, area: Rect) {
             .current_answer()
             .map(|(i, t)| format!("{}/{} ", i + 1, t))
             .unwrap_or_default(),
+        View::Comments => format!("{}/{} ", app.comments.items.len(), app.comments.total),
         _ => String::new(),
     };
     f.render_widget(
@@ -106,6 +109,10 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
         // 长回答里得知道自己在文中哪儿
         View::Reading => app
             .scroll_progress()
+            .map(|(cur, max)| format!("{cur}/{max} "))
+            .unwrap_or_default(),
+        View::Comments => app
+            .comment_progress()
             .map(|(cur, max)| format!("{cur}/{max} "))
             .unwrap_or_default(),
         // 列表里得知道上下还压着多少条

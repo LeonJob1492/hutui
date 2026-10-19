@@ -95,6 +95,31 @@ pub fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 相对时间：1792299923 这样的 unix 秒 → 「3 小时前」
+pub fn ago(ts: i64) -> String {
+    if ts <= 0 {
+        return String::new();
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let d = (now - ts).max(0);
+    if d < 60 {
+        "刚刚".to_string()
+    } else if d < 3600 {
+        format!("{} 分钟前", d / 60)
+    } else if d < 86_400 {
+        format!("{} 小时前", d / 3600)
+    } else if d < 86_400 * 30 {
+        format!("{} 天前", d / 86_400)
+    } else if d < 86_400 * 365 {
+        format!("{} 个月前", (d / (86_400 * 30)).max(1))
+    } else {
+        format!("{} 年前", (d / (86_400 * 365)).max(1))
+    }
+}
+
 /// 1100 → 1.1k
 pub fn compact_num(n: i64) -> String {
     if n >= 10_000 {

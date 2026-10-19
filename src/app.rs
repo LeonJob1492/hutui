@@ -8,13 +8,39 @@ use crate::bridge::{Cmd, Event as BridgeEvent};
 use crate::config;
 use crate::state::ReadLog;
 use crate::ui;
-use crate::zhihu::AnswerItem;
+use crate::zhihu::{AnswerItem, AnswerMeta, Comment, Vote};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum View {
     List,
     Reading,
+    Comments,
     Panic,
+}
+
+/// 评论区状态
+pub struct CommentsState {
+    pub aid: String,
+    pub items: Vec<Comment>,
+    pub lines: Vec<Line<'static>>,
+    pub total: usize,
+    pub next_offset: usize,
+    pub scroll: usize,
+    pub loading: bool,
+}
+
+impl Default for CommentsState {
+    fn default() -> Self {
+        Self {
+            aid: String::new(),
+            items: Vec::new(),
+            lines: Vec::new(),
+            total: 0,
+            next_offset: 0,
+            scroll: 0,
+            loading: false,
+        }
+    }
 }
 
 pub struct App {
@@ -26,7 +52,6 @@ pub struct App {
     pub feed: Vec<AnswerItem>,
     pub cursor: usize,
     pub list_offset: usize,
-    /// 列表可视区上方 / 下方还剩多少条，给 footer 提示用
     pub list_above: usize,
     pub list_below: usize,
     /// 看过的条目
@@ -35,14 +60,14 @@ pub struct App {
     // ---- 阅读：一条一屏，↑↓ 换条
     pub stream: Vec<AnswerItem>,
     pub index: usize,
-    /// 该问题下回答总数（接口给的 paging.totals）
     pub total: usize,
-    /// 当前这条回答摊平后的行
     pub lines: Vec<Line<'static>>,
-    /// 当前这条回答内的滚动位置
     pub scroll: usize,
-    /// 按回答 id 记住各自的滚动位置，切回来不丢
     scroll_by_id: HashMap<String, usize>,
+
+    /// 每条内容上我的表态（赞/收藏）
+    pub meta: HashMap<String, AnswerMeta>,
+    pub comments: CommentsState,
 
     // ---- 布局
     pub built_width: u16,
@@ -71,6 +96,8 @@ impl App {
             lines: Vec::new(),
             scroll: 0,
             scroll_by_id: HashMap::new(),
+            meta: HashMap::new(),
+            comments: CommentsState::default(),
             built_width: 0,
             body_h: 0,
             status: "连接中…".into(),
@@ -122,6 +149,7 @@ impl App {
             }
             View::List => self.on_key_list(k),
             View::Reading => self.on_key_reading(k),
+            View::Comments => self.on_key_comments(k),
         }
     }
 
@@ -147,7 +175,6 @@ impl App {
         }
     }
 
-    /// 阅读视图：↑↓ 换回答；单条比一屏长时用 PgUp/PgDn 在条内滚。
     fn on_key_reading(&mut self, k: KeyEvent) {
         let page = (self.body_h.saturating_sub(1) as usize).max(1);
         match k.code {
@@ -155,11 +182,43 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.step_answer(1),
             KeyCode::Char('n') => self.step_answer(1),
             KeyCode::Char('p') => self.step_answer(-1),
+            KeyCode::Char('z') => self.toggle_vote(),
+            KeyCode::Char('c') => self.toggle_fav(),
+            KeyCode::Char('x') => self.open_comments(),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
             KeyCode::PageDown => self.scroll_by(page),
             KeyCode::Home => self.scroll = 0,
             KeyCode::End => self.scroll = self.max_scroll(),
             KeyCode::Left | KeyCode::Backspace => self.back_to_list(),
+            KeyCode::Char('q') => self.quit = true,
+            _ => {}
+        }
+    }
+
+    fn on_key_comments(&mut self, k: KeyEvent) {
+        let page = (self.body_h.saturating_sub(1) as usize).max(1);
+        let max = self
+            .comments
+            .lines
+            .len()
+            .saturating_sub(self.body_h as usize);
+        match k.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.comments.scroll = self.comments.scroll.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.comments.scroll = (self.comments.scroll + 1).min(max)
+            }
+            KeyCode::PageUp => self.comments.scroll = self.comments.scroll.saturating_sub(page),
+            KeyCode::PageDown => self.comments.scroll = (self.comments.scroll + page).min(max),
+            KeyCode::Home => self.comments.scroll = 0,
+            KeyCode::End => self.comments.scroll = max,
+            KeyCode::Enter => self.load_more_comments(),
+            KeyCode::Char('x') | KeyCode::Left | KeyCode::Backspace => {
+                self.view = View::Reading;
+                self.resume = View::Reading;
+                self.status.clear();
+            }
             KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
@@ -175,6 +234,10 @@ impl App {
             self.resume = self.view;
             self.view = View::Panic;
         }
+    }
+
+    fn current(&self) -> Option<&AnswerItem> {
+        self.stream.get(self.index)
     }
 
     fn open_reading(&mut self) {
@@ -208,7 +271,6 @@ impl App {
         self.status.clear();
     }
 
-    /// 切换到上/下一条回答，顺带还原那条自己的滚动位置
     fn step_answer(&mut self, delta: isize) {
         if self.stream.is_empty() {
             return;
@@ -234,6 +296,71 @@ impl App {
         self.rebuild();
     }
 
+    /// z：赞（已赞则取消）
+    fn toggle_vote(&mut self) {
+        let Some(item) = self.current() else { return };
+        let cur = self.meta.get(&item.id).map(|m| m.vote).unwrap_or(Vote::None);
+        let next = if cur == Vote::Up {
+            Vote::None
+        } else {
+            Vote::Up
+        };
+        let _ = self.tx.send(Cmd::Vote {
+            aid: item.id.clone(),
+            kind: item.kind.clone(),
+            vote: next,
+        });
+    }
+
+    /// c：收藏（已收藏则取消）
+    fn toggle_fav(&mut self) {
+        let Some(item) = self.current() else { return };
+        let on = !self.meta.get(&item.id).map(|m| m.faved).unwrap_or(false);
+        let _ = self.tx.send(Cmd::Favorite {
+            aid: item.id.clone(),
+            kind: item.kind.clone(),
+            on,
+        });
+    }
+
+    /// x：评论区
+    fn open_comments(&mut self) {
+        let Some(item) = self.current() else { return };
+        let aid = item.id.clone();
+        let kind = item.kind.clone();
+
+        if self.comments.aid != aid {
+            self.comments = CommentsState {
+                aid: aid.clone(),
+                loading: true,
+                ..Default::default()
+            };
+            self.comments.lines = Vec::new();
+            let _ = self.tx.send(Cmd::Comments {
+                aid,
+                kind,
+                offset: 0,
+            });
+        }
+        self.view = View::Comments;
+        self.resume = View::Comments;
+    }
+
+    fn load_more_comments(&mut self) {
+        if self.comments.loading || self.comments.items.len() >= self.comments.total {
+            return;
+        }
+        let Some((aid, kind)) = self.current().map(|i| (i.id.clone(), i.kind.clone())) else {
+            return;
+        };
+        self.comments.loading = true;
+        let _ = self.tx.send(Cmd::Comments {
+            aid,
+            kind,
+            offset: self.comments.next_offset,
+        });
+    }
+
     fn max_scroll(&self) -> usize {
         self.lines.len().saturating_sub(self.body_h as usize)
     }
@@ -244,12 +371,13 @@ impl App {
 
     // ------------------------------------------------------------- 布局
 
-    /// 宽度变化时重建当前回答的行（换行结果依赖宽度）
     pub fn ensure_layout(&mut self, width: u16) {
         if self.built_width != width {
             self.built_width = width;
-            if self.view == View::Reading {
-                self.rebuild();
+            match self.view {
+                View::Reading => self.rebuild(),
+                View::Comments => self.rebuild_comments(),
+                _ => {}
             }
         }
     }
@@ -257,10 +385,11 @@ impl App {
     pub fn rebuild(&mut self) {
         let w = self.built_width.max(24);
         let shown = self.total.max(self.stream.len());
+        let meta = self.current().and_then(|it| self.meta.get(&it.id));
         self.lines = self
             .stream
             .get(self.index)
-            .map(|item| ui::reading::build(item, self.index, shown, w))
+            .map(|item| ui::reading::build(item, self.index, shown, meta, w))
             .unwrap_or_default();
         let max = self.max_scroll();
         if self.scroll > max {
@@ -268,7 +397,24 @@ impl App {
         }
     }
 
-    /// 当前读到第几条（给 header 用）：(从 0 开始的序号, 总数)
+    pub fn rebuild_comments(&mut self) {
+        let w = self.built_width.max(24);
+        self.comments.lines = ui::comments::build(
+            &self.comments.items,
+            self.comments.total,
+            self.comments.loading,
+            w,
+        );
+        let max = self
+            .comments
+            .lines
+            .len()
+            .saturating_sub(self.body_h as usize);
+        if self.comments.scroll > max {
+            self.comments.scroll = max;
+        }
+    }
+
     pub fn current_answer(&self) -> Option<(usize, usize)> {
         if self.stream.is_empty() {
             return None;
@@ -276,13 +422,24 @@ impl App {
         Some((self.index, self.total.max(self.stream.len())))
     }
 
-    /// 条内滚动进度：(已滚, 总可滚)，给 footer 用
     pub fn scroll_progress(&self) -> Option<(usize, usize)> {
         let max = self.max_scroll();
         if max == 0 {
             return None;
         }
         Some((self.scroll.min(max), max))
+    }
+
+    pub fn comment_progress(&self) -> Option<(usize, usize)> {
+        let max = self
+            .comments
+            .lines
+            .len()
+            .saturating_sub(self.body_h as usize);
+        if max == 0 {
+            return None;
+        }
+        Some((self.comments.scroll.min(max), max))
     }
 
     // ------------------------------------------------------------- 桥接事件
@@ -299,7 +456,6 @@ impl App {
                 self.status = format!("{} items", self.feed.len());
             }
 
-            // a：当前这条回答的权威内容
             BridgeEvent::Answer(item) => {
                 if let Some(slot) = self.stream.iter_mut().find(|x| x.id == item.id) {
                     *slot = item;
@@ -310,7 +466,6 @@ impl App {
                 self.rebuild();
             }
 
-            // b：该问题下的回答列表，按接口顺序重排并把当前这条定位到它自己的位置
             BridgeEvent::Answers { items, total } => {
                 self.total = total.max(items.len());
                 let cur_id = self
@@ -335,6 +490,48 @@ impl App {
                 self.scroll = scroll;
                 self.rebuild();
                 self.status = format!("{} 条回答", self.total);
+            }
+
+            BridgeEvent::Voted { aid, vote, count } => {
+                let m = self.meta.entry(aid).or_default();
+                m.vote = vote;
+                m.voteup = count;
+                self.status = match vote {
+                    Vote::Up => format!("已赞 · {count}"),
+                    Vote::Down => format!("已反对 · {count}"),
+                    Vote::None => "已取消赞同".into(),
+                };
+                self.rebuild();
+            }
+
+            BridgeEvent::Faved { aid, on } => {
+                self.meta.entry(aid).or_default().faved = on;
+                self.status = if on {
+                    "已收藏".into()
+                } else {
+                    "已取消收藏".into()
+                };
+                self.rebuild();
+            }
+
+            BridgeEvent::Comments {
+                aid,
+                items,
+                total,
+                next_offset,
+            } => {
+                if self.comments.aid == aid {
+                    for c in items {
+                        if !self.comments.items.iter().any(|x| x.id == c.id) {
+                            self.comments.items.push(c);
+                        }
+                    }
+                    self.comments.total = total;
+                    self.comments.next_offset = next_offset;
+                    self.comments.loading = false;
+                    self.rebuild_comments();
+                }
+                self.status = format!("{} 条评论", total);
             }
 
             BridgeEvent::Error(e) => self.status = format!("× {e}"),

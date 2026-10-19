@@ -90,6 +90,27 @@ window.fetch 是原生函数（/[native code]/），知乎没有 patch 它
 **实验方法备忘**：怀疑「某接口不可直接调用」时，先在页面上下文里裸 fetch 一次看状态码，
 不要从历史结论往下推。签名是不是必需，一条 `fetch` 就能证伪。
 
+### 2.5 写接口（赞 / 收藏 / 评论）
+
+只多一个头：`x-xsrftoken`（值就是页面里的 `_xsrf` cookie），**仍然不需要签名**。
+实测全部成功，每次探针都还原了现场（赞同数 80→81→80，收藏夹 6420→6421→6420）。
+
+| 动作 | 请求 |
+|---|---|
+| 赞 / 反对 / 取消 | `POST /api/v4/answers/{aid}/voters`，body `{"type":"up"\|"down"\|"neutral"}` |
+| 收藏 | `POST /api/v4/collections/{cid}/contents?content_id={aid}&content_type=answer` |
+| 取消收藏 | `DELETE /api/v4/collections/contents/answer/{aid}` |
+| 默认收藏夹 | `GET /api/v4/me` → `GET /api/v4/people/{url_token}/collections`，取 `is_default` |
+| 评论列表 | `GET /api/v4/answers/{aid}/comments?limit=20&offset=0&order=normal` |
+
+**两个坑**：
+
+- 收藏的 add 端点走 JSON body 会返回 `400 missing content_id or content_type`，**参数必须放 query，body 必须为空**。
+- 评论作者不在 `author.name`，在 **`author.member.name`**。
+
+表态结果以响应里的 `reaction_value`（`up` / `down` / 空串）和 `reaction_count` 为准，
+不要自己猜——服务端是幂等的，重复提交同向不会叠加。
+
 ## 3. 架构
 
 ```
@@ -135,7 +156,11 @@ window.fetch 是原生函数（/[native code]/），知乎没有 patch 它
 
 阅读  一条一屏。↑↓ / j k / n p 切换该问题下的上/下一条
       PgUp/PgDn · Home/End  在当前这条内部滚动（每条按 id 记住位置）
+      z 赞 / 取消          c 收藏 / 取消        x 评论区
       ← / Backspace 返回列表
+
+评论  独立视图（只读）。↑↓ / PgUp/PgDn 滚动      ↵ 加载更多
+      x / ← / Backspace 回阅读
 
 panic Esc 连按两下 或 Ctrl-H ──► 全屏重绘成静止的 cargo test 画面
       任意键（或再按 Esc）恢复
@@ -186,7 +211,7 @@ footer  {状态}                                            ↑12 ↓8
 - 不模拟页面点击 / 滚动，不解析 DOM
 - 不重写签名算法、不伪造 UA
 - 不做 headless（有窗口 + `open -g`）
-- 不做写操作（赞同/收藏/评论）
+- 不发评论、不回复（评论区只读）
 - 不做自动伪装，只保留手动 panic
 
 ## 8. 待办

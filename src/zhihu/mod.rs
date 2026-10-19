@@ -25,3 +25,49 @@ impl AnswerItem {
         }
     }
 }
+
+/// 一条评论
+#[derive(Debug, Clone, Default)]
+pub struct Comment {
+    pub id: String,
+    pub author: String,
+    pub content: String,
+    pub voteup: i64,
+    pub children: i64,
+    pub created: i64,
+}
+
+/// 我对某条内容的表态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Vote {
+    #[default]
+    None,
+    Up,
+    Down,
+}
+
+impl Vote {
+    pub fn from_api(s: &str) -> Self {
+        match s {
+            "up" => Vote::Up,
+            "down" => Vote::Down,
+            _ => Vote::None,
+        }
+    }
+
+    pub fn as_api(self) -> &'static str {
+        match self {
+            Vote::Up => "up",
+            Vote::Down => "down",
+            Vote::None => "neutral",
+        }
+    }
+}
+
+/// 我对这条内容的本地表态 + 最新计数
+#[derive(Debug, Clone, Default)]
+pub struct AnswerMeta {
+    pub vote: Vote,
+    pub voteup: i64,
+    pub faved: bool,
+}

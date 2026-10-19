@@ -1,4 +1,4 @@
-use super::AnswerItem;
+use super::{AnswerItem, Comment};
 use serde_json::Value;
 
 // ---------------------------------------------------------------- JSON 取值
@@ -238,5 +238,43 @@ mod tests {
         assert!(t.contains("hi"));
         assert!(t.contains("there"));
         assert!(!t.contains("var a"));
+    }
+}
+
+// ---------------------------------------------------------------- 评论
+
+/// `/api/v4/answers/{aid}/comments` —— 作者在 `author.member.name`
+pub fn parse_comments(v: &Value) -> (Vec<Comment>, usize) {
+    let items = v["data"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|c| Comment {
+                    id: as_str(&c["id"]),
+                    author: as_str(&c["author"]["member"]["name"]),
+                    content: html_to_text(c.get("content").and_then(|x| x.as_str()).unwrap_or("")),
+                    voteup: as_i64(&c["vote_count"]),
+                    children: as_i64(&c["child_comment_count"]),
+                    created: as_i64(&c["created_time"]),
+                })
+                .collect::<Vec<Comment>>()
+        })
+        .unwrap_or_default();
+    let total = v["paging"]["totals"].as_u64().unwrap_or(items.len() as u64) as usize;
+    (items, total)
+}
+
+/// 找默认收藏夹：`/api/v4/people/{token}/collections`
+pub fn parse_default_collection(v: &Value) -> Option<String> {
+    let arr = v["data"].as_array()?;
+    let pick = arr
+        .iter()
+        .find(|c| c["is_default"].as_bool().unwrap_or(false))
+        .or_else(|| arr.first())?;
+    let id = as_str(&pick["id"]);
+    if id.is_empty() {
+        None
+    } else {
+        Some(id)
     }
 }

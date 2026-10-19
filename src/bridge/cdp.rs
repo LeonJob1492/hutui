@@ -147,22 +147,8 @@ impl Cdp {
         }
     }
 
-    /// 在页面上下文里 `fetch(url)` 并把响应体当 JSON 返回。
-    ///
-    /// 用的是页面自己的同源上下文和登录 cookie —— 不做任何签名伪造，
-    /// 这些接口本身也不校验签名（实测）。
-    pub fn fetch_json(&mut self, session: &str, url: &str) -> Result<Value> {
-        let quoted = serde_json::to_string(url)?;
-        let expr = format!(
-            "(async () => {{ \
-               try {{ \
-                 const r = await fetch({quoted}, {{ credentials: 'include' }}); \
-                 const t = await r.text(); \
-                 return {{ ok: r.ok, status: r.status, text: t }}; \
-               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e) }}; }} \
-             }})()"
-        );
-
+    /// 在页面上下文里跑一段 JS，返回 (ok, status, text)
+    fn run_js(&mut self, session: &str, expr: &str) -> Result<(bool, i64, String)> {
         let res = self.call(
             "Runtime.evaluate",
             json!({ "expression": expr, "returnByValue": true, "awaitPromise": true }),
@@ -177,13 +163,75 @@ impl Cdp {
                 .unwrap_or_else(|| "无返回值".into());
             bail!("页面求值失败: {detail}");
         }
+        Ok((
+            val["ok"].as_bool().unwrap_or(false),
+            val["status"].as_i64().unwrap_or(0),
+            val["text"].as_str().unwrap_or("").to_string(),
+        ))
+    }
 
-        let status = val["status"].as_i64().unwrap_or(0);
-        let text = val["text"].as_str().unwrap_or("");
-        if status != 200 {
+    /// 读接口：在页面同源上下文里 GET，返回解析后的 JSON。
+    ///
+    /// 用的是页面自己的 cookie —— 不做任何签名伪造，这些接口本身也不校验签名。
+    pub fn fetch_json(&mut self, session: &str, url: &str) -> Result<Value> {
+        let quoted = serde_json::to_string(url)?;
+        let expr = format!(
+            "(async () => {{ \
+               try {{ \
+                 const r = await fetch({quoted}, {{ credentials: 'include' }}); \
+                 return {{ ok: r.ok, status: r.status, text: await r.text() }}; \
+               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e) }}; }} \
+             }})()"
+        );
+
+        let (ok, status, text) = self.run_js(session, &expr)?;
+        if !ok || status != 200 {
             let head: String = text.chars().take(160).collect();
             bail!("{} → HTTP {status}: {head}", brief(url));
         }
-        serde_json::from_str(text).with_context(|| format!("{} 返回的不是 JSON", brief(url)))
+        serde_json::from_str(&text).with_context(|| format!("{} 返回的不是 JSON", brief(url)))
+    }
+
+    /// 写接口：带上页面里的 `_xsrf` 作为 x-xsrftoken。
+    pub fn write_json(
+        &mut self,
+        session: &str,
+        method: &str,
+        url: &str,
+        body: Option<&str>,
+    ) -> Result<Value> {
+        let url_lit = serde_json::to_string(url)?;
+        let method_lit = serde_json::to_string(method)?;
+        let body_lit = match body {
+            Some(b) => serde_json::to_string(b)?,
+            None => "null".to_string(),
+        };
+
+        let expr = format!(
+            "(async () => {{ \
+               const xsrf = decodeURIComponent(((document.cookie.match(/_xsrf=([^;]+)/) || [])[1] || '')); \
+               try {{ \
+                 const h = {{ 'x-xsrftoken': xsrf }}; \
+                 if ({body_lit} !== null) h['content-type'] = 'application/json'; \
+                 const r = await fetch({url_lit}, {{ \
+                   method: {method_lit}, \
+                   credentials: 'include', \
+                   headers: h, \
+                   body: {body_lit} \
+                 }}); \
+                 return {{ ok: r.ok, status: r.status, text: await r.text() }}; \
+               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e) }}; }} \
+             }})()"
+        );
+
+        let (ok, status, text) = self.run_js(session, &expr)?;
+        if !ok || !(200..300).contains(&status) {
+            let head: String = text.chars().take(160).collect();
+            bail!("{method} {} → HTTP {status}: {head}", brief(url));
+        }
+        if text.trim().is_empty() {
+            return Ok(Value::Null);
+        }
+        Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
     }
 }

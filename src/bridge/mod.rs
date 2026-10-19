@@ -2,15 +2,35 @@ pub mod cdp;
 pub mod chrome;
 pub mod worker;
 
-use crate::zhihu::AnswerItem;
+use crate::zhihu::{AnswerItem, Comment, Vote};
 use std::sync::mpsc::{channel, Receiver, Sender};
 
 /// 主线程 → 工作线程
 #[derive(Debug, Clone)]
 pub enum Cmd {
-    LoadFeed { want: usize },
+    LoadFeed {
+        want: usize,
+    },
     /// a = 当前这条回答的权威内容，b = 该问题下的回答列表
-    OpenAnswer { qid: String, aid: String },
+    OpenAnswer {
+        qid: String,
+        aid: String,
+    },
+    Vote {
+        aid: String,
+        kind: String,
+        vote: Vote,
+    },
+    Favorite {
+        aid: String,
+        kind: String,
+        on: bool,
+    },
+    Comments {
+        aid: String,
+        kind: String,
+        offset: usize,
+    },
 }
 
 /// 工作线程 → 主线程
@@ -21,7 +41,25 @@ pub enum Event {
     /// 当前这条回答
     Answer(AnswerItem),
     /// 该问题下的回答列表（增量）
-    Answers { items: Vec<AnswerItem>, total: usize },
+    Answers {
+        items: Vec<AnswerItem>,
+        total: usize,
+    },
+    Voted {
+        aid: String,
+        vote: Vote,
+        count: i64,
+    },
+    Faved {
+        aid: String,
+        on: bool,
+    },
+    Comments {
+        aid: String,
+        items: Vec<Comment>,
+        total: usize,
+        next_offset: usize,
+    },
     Error(String),
 }
 

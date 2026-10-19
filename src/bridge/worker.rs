@@ -7,13 +7,11 @@ use super::cdp::Cdp;
 use super::{chrome, Cmd, Event};
 use crate::config;
 use crate::zhihu::parse;
-use crate::zhihu::AnswerItem;
+use crate::zhihu::{AnswerItem, Vote};
 
 const HOME: &str = "https://www.zhihu.com";
 const FEED_URL: &str = "https://www.zhihu.com/api/v3/feed/topstory/recommend?limit=10&desktop=true";
-/// 单篇回答要的字段
 const ANSWER_INCLUDE: &str = "content,excerpt,author,voteup_count,comment_count,question";
-/// 回答列表要的字段
 const LIST_INCLUDE: &str = "data[*].content,excerpt,author,voteup_count,comment_count,question";
 
 pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
@@ -22,6 +20,9 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
         let result = match cmd {
             Cmd::LoadFeed { want } => ctx.load_feed(&tx, want),
             Cmd::OpenAnswer { qid, aid } => ctx.open_answer(&tx, &qid, &aid),
+            Cmd::Vote { aid, kind, vote } => ctx.vote(&tx, &aid, &kind, vote),
+            Cmd::Favorite { aid, kind, on } => ctx.favorite(&tx, &aid, &kind, on),
+            Cmd::Comments { aid, kind, offset } => ctx.comments(&tx, &aid, &kind, offset),
         };
         if let Err(e) = result {
             let _ = tx.send(Event::Error(format!("{e:#}")));
@@ -33,14 +34,34 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
 struct Ctx {
     cdp: Option<Cdp>,
     session: Option<String>,
+    /// 默认收藏夹 id，懒加载后缓存
+    collection: Option<String>,
 }
 
-/// include 参数里的方括号星号要转义，否则页面 fetch 会当成通配
+/// include 参数里的方括号星号要转义
 fn enc(include: &str) -> String {
     include
         .replace('[', "%5B")
         .replace(']', "%5D")
         .replace('*', "%2A")
+}
+
+/// 内容类型 → 接口路径段
+fn seg(kind: &str) -> &'static str {
+    match kind {
+        "article" => "articles",
+        "pin" => "pins",
+        _ => "answers",
+    }
+}
+
+/// 内容类型 → 收藏用的 content_type
+fn content_type(kind: &str) -> &'static str {
+    match kind {
+        "article" => "article",
+        "pin" => "pin",
+        _ => "answer",
+    }
 }
 
 impl Ctx {
@@ -55,7 +76,7 @@ impl Ctx {
         let _ = tx.send(Event::Status("连接调试端口…".into()));
         let mut cdp = Cdp::connect(config::CDP_PORT)?;
 
-        // 直接建一个知乎页当同源上下文：fetch 必须在 zhihu.com 源下才带得上 cookie
+        // 建一个知乎页当同源上下文：fetch 必须在 zhihu.com 源下才带得上 cookie
         let created = cdp.call("Target.createTarget", json!({ "url": format!("{HOME}/") }), None)?;
         let target_id = created["targetId"]
             .as_str()
@@ -78,7 +99,6 @@ impl Ctx {
         Ok(())
     }
 
-    /// 等页面真正落到 zhihu.com 域，否则 fetch 会被 CORS 挡掉
     fn wait_origin(&mut self, tx: &Sender<Event>) -> Result<()> {
         let _ = tx.send(Event::Status("等待知乎页面就绪…".into()));
         let session = self
@@ -111,7 +131,17 @@ impl Ctx {
         cdp.fetch_json(&session, url)
     }
 
-    /// 推荐流：首页一页 6 条，之后跟着 paging.next 翻
+    fn write(&mut self, method: &str, url: &str, body: Option<&str>) -> Result<serde_json::Value> {
+        let session = self
+            .session
+            .clone()
+            .ok_or_else(|| anyhow!("桥接尚未建立会话"))?;
+        let cdp = self.cdp.as_mut().ok_or_else(|| anyhow!("桥接未连接"))?;
+        cdp.write_json(&session, method, url, body)
+    }
+
+    // ---------------------------------------------------------------- 读
+
     fn load_feed(&mut self, tx: &Sender<Event>, want: usize) -> Result<()> {
         self.ensure(tx)?;
         let _ = tx.send(Event::Status("拉取推荐流…".into()));
@@ -140,11 +170,9 @@ impl Ctx {
         Ok(())
     }
 
-    /// a：当前这条回答；b：该问题下的回答列表
     fn open_answer(&mut self, tx: &Sender<Event>, qid: &str, aid: &str) -> Result<()> {
         self.ensure(tx)?;
 
-        // ---- a
         let _ = tx.send(Event::Status("拉取这条回答…".into()));
         let url = format!("{HOME}/api/v4/answers/{aid}?include={}", enc(ANSWER_INCLUDE));
         match self.fetch(&url) {
@@ -154,12 +182,10 @@ impl Ctx {
                 }
             }
             Err(e) => {
-                // 单篇失败不影响列表，列表拿到也能读
                 let _ = tx.send(Event::Status(format!("这条回答取不到：{e}")));
             }
         }
 
-        // ---- b
         if qid.is_empty() {
             let _ = tx.send(Event::Status("这条没有所属问题".into()));
             return Ok(());
@@ -168,9 +194,8 @@ impl Ctx {
         let _ = tx.send(Event::Status("拉取同问题回答…".into()));
         let mut acc: Vec<AnswerItem> = Vec::new();
         let mut offset = 0usize;
-        let limit = config::ANSWERS_PAGE as usize;
+        let limit = config::ANSWERS_PAGE;
 
-        // 接口的 paging.totals 直接给出总数，翻到 is_end 或触顶就停
         let total = loop {
             let url = format!(
                 "{HOME}/api/v4/questions/{qid}/answers?include={}&offset={offset}&limit={limit}&order=default&platform=desktop",
@@ -193,6 +218,94 @@ impl Ctx {
         };
 
         let _ = tx.send(Event::Status(format!("{total} 条回答")));
+        Ok(())
+    }
+
+    fn comments(&mut self, tx: &Sender<Event>, aid: &str, kind: &str, offset: usize) -> Result<()> {
+        self.ensure(tx)?;
+        let url = format!(
+            "{HOME}/api/v4/{0}/{aid}/comments?limit={1}&offset={offset}&order=normal",
+            seg(kind),
+            config::COMMENTS_PAGE
+        );
+        let v = self.fetch(&url)?;
+        let (items, total) = parse::parse_comments(&v);
+        let next = offset + items.len();
+        let _ = tx.send(Event::Comments {
+            aid: aid.to_string(),
+            items,
+            total,
+            next_offset: next,
+        });
+        Ok(())
+    }
+
+    // ---------------------------------------------------------------- 写
+
+    fn vote(&mut self, tx: &Sender<Event>, aid: &str, kind: &str, vote: Vote) -> Result<()> {
+        self.ensure(tx)?;
+        let _ = tx.send(Event::Status("提交表态…".into()));
+
+        let url = format!("{HOME}/api/v4/{}/{aid}/voters", seg(kind));
+        let body = format!("{{\"type\":\"{}\"}}", vote.as_api());
+        let v = self.write("POST", &url, Some(&body))?;
+
+        let vote = Vote::from_api(v["reaction_value"].as_str().unwrap_or(""));
+        let count = v["reaction_count"].as_i64().unwrap_or(0);
+        let _ = tx.send(Event::Voted {
+            aid: aid.to_string(),
+            vote,
+            count,
+        });
+        Ok(())
+    }
+
+    fn default_collection(&mut self) -> Result<String> {
+        if let Some(c) = &self.collection {
+            return Ok(c.clone());
+        }
+        let me = self.fetch(&format!("{HOME}/api/v4/me"))?;
+        let token = me["url_token"].as_str().unwrap_or_default().to_string();
+        if token.is_empty() {
+            bail!("拿不到自己的 url_token");
+        }
+        let list = self.fetch(&format!(
+            "{HOME}/api/v4/people/{token}/collections?offset=0&limit=20"
+        ))?;
+        let id =
+            parse::parse_default_collection(&list).ok_or_else(|| anyhow!("找不到默认收藏夹"))?;
+        self.collection = Some(id.clone());
+        Ok(id)
+    }
+
+    fn favorite(&mut self, tx: &Sender<Event>, aid: &str, kind: &str, on: bool) -> Result<()> {
+        self.ensure(tx)?;
+        let _ = tx.send(Event::Status(if on {
+            "收藏…".into()
+        } else {
+            "取消收藏…".into()
+        }));
+
+        if on {
+            let cid = self.default_collection()?;
+            // 这个端点的参数走 query，body 必须为空
+            let url = format!(
+                "{HOME}/api/v4/collections/{cid}/contents?content_id={aid}&content_type={}",
+                content_type(kind)
+            );
+            self.write("POST", &url, None)?;
+        } else {
+            let url = format!(
+                "{HOME}/api/v4/collections/contents/{}/{aid}",
+                content_type(kind)
+            );
+            self.write("DELETE", &url, None)?;
+        }
+
+        let _ = tx.send(Event::Faved {
+            aid: aid.to_string(),
+            on,
+        });
         Ok(())
     }
 }
