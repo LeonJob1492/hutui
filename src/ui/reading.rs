@@ -28,24 +28,36 @@ pub fn build(
     };
     let count = meta.map(|m| m.voteup).filter(|c| *c > 0).unwrap_or(item.voteup);
 
-    let mut tail = format!("{author}  ·  {} 赞", text::compact_num(count));
-    if let Some(m) = meta {
-        if m.vote == Vote::Up {
-            tail.push_str("  ✓");
-        } else if m.vote == Vote::Down {
-            tail.push_str("  ✗");
-        }
-        if m.faved {
-            tail.push_str("  ·  已收藏");
-        }
-    }
+    let head = format!(
+        " {}/{}  ·  {author}  ·  {} 赞 ",
+        index + 1,
+        total,
+        text::compact_num(count)
+    );
+    let (vote, faved) = meta.map(|m| (m.vote, m.faved)).unwrap_or((item.my_vote, false));
 
-    let head = format!(" {}/{}  ·  {tail} ", index + 1, total);
-    let dashes = w.saturating_sub(text::width(&head) + 2).max(2);
-    lines.push(Line::from(Span::styled(
-        format!("──{}{}", head, "─".repeat(dashes)),
-        Style::default().fg(theme::FAINT),
-    )));
+    let faint = Style::default().fg(theme::FAINT);
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(format!("──{head}"), faint)];
+    let mut used = text::width(&head) + 2;
+
+    match vote {
+        Vote::Up => {
+            spans.push(Span::styled("✓ ", Style::default().fg(theme::ACCENT)));
+            used += 2;
+        }
+        Vote::Down => {
+            spans.push(Span::styled("✗ ", Style::default().fg(theme::WARN)));
+            used += 2;
+        }
+        Vote::None => {}
+    }
+    if faved {
+        let fav = "· 已收藏 ";
+        used += text::width(fav);
+        spans.push(Span::styled(fav.to_string(), Style::default().fg(theme::DIM)));
+    }
+    spans.push(Span::styled("─".repeat(w.saturating_sub(used).max(2)), faint));
+    lines.push(Line::from(spans));
 
     if !item.question_title.is_empty() {
         let t = text::truncate(&text::one_line(&item.question_title), w.saturating_sub(4));

@@ -161,7 +161,7 @@ window.fetch 是原生函数（/[native code]/），知乎没有 patch 它
 
 阅读  一条一屏。↑↓ / j k / n p 切换该问题下的上/下一条
       PgUp/PgDn · Home/End  在当前这条内部滚动（每条按 id 记住位置）
-      z 赞 / 取消          c 收藏 / 取消        x 评论区
+      z 赞 / 取消          v 反对 / 取消        c 收藏 / 取消        x 评论区
       ← / Backspace 返回列表
 
 评论  独立视图（只读）。↑↓ / PgUp/PgDn 滚动      ↵ 加载更多

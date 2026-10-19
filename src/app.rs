@@ -182,7 +182,8 @@ impl App {
             KeyCode::Down | KeyCode::Char('j') => self.step_answer(1),
             KeyCode::Char('n') => self.step_answer(1),
             KeyCode::Char('p') => self.step_answer(-1),
-            KeyCode::Char('z') => self.toggle_vote(),
+            KeyCode::Char('z') => self.toggle_vote(Vote::Up),
+            KeyCode::Char('v') => self.toggle_vote(Vote::Down),
             KeyCode::Char('c') => self.toggle_fav(),
             KeyCode::Char('x') => self.open_comments(),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
@@ -306,15 +307,15 @@ impl App {
         self.rebuild();
     }
 
-    /// z：赞（已赞则取消）
-    fn toggle_vote(&mut self) {
+    /// z = 赞，v = 反对；再按同一个键就取消
+    fn toggle_vote(&mut self, target: Vote) {
         let Some(item) = self.current() else { return };
-        let cur = self.meta.get(&item.id).map(|m| m.vote).unwrap_or(Vote::None);
-        let next = if cur == Vote::Up {
-            Vote::None
-        } else {
-            Vote::Up
-        };
+        let cur = self
+            .meta
+            .get(&item.id)
+            .map(|m| m.vote)
+            .unwrap_or(item.my_vote);
+        let next = if cur == target { Vote::None } else { target };
         let _ = self.tx.send(Cmd::Vote {
             aid: item.id.clone(),
             kind: item.kind.clone(),

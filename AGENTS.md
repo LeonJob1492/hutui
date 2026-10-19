@@ -75,7 +75,7 @@ Ghostty 自带 shell 集成**不写标题**；`/Users/leon/.zshrc` 的 `_leon_wi
 | 取数方式 | **直接 `fetch` 接口**：页面同源上下文里一次 `fetch`，跟随 `paging.next` / 按 `offset` 翻页；不模拟页面操作 |
 | 单篇 / 列表 | a = `/api/v4/answers/{aid}` 展示当前条，b = `/api/v4/questions/{qid}/answers` 准备 ↑↓ 切换（`paging.totals` 给总数） |
 | 写操作 | 赞 / 收藏 / 评论均已实测（只需 `x-xsrftoken`，不需签名），接口见 `docs/design.md` 2.5；评论只读 |
-| 键位 | 列表 ↑↓ → ←；阅读 ↑↓ 换回答、PgUp/PgDn 条内滚动、`z` 赞、`x` 评论区、`c` 收藏、← 返回；评论区 `↵` 加载更多；`Esc`×2 或 `Ctrl-H` panic |
+| 键位 | 列表 ↑↓ → ←；阅读 ↑↓ 换回答、PgUp/PgDn 条内滚动、`z` 赞、`v` 反对、`x` 评论区、`c` 收藏、← 返回；评论区 `↵` 加载更多；`Esc`×2 或 `Ctrl-H` panic |
 
 ## 代码结构
 
