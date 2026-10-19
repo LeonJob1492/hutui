@@ -95,6 +95,7 @@ src/bridge/          chrome 生命周期 · cdp 客户端 · 工作线程
 
 ## 文档索引
 
+- **README（对外介绍）**：`/Users/leon/Code/hutui/README.md`
 - **项目设计文档（实现的唯一事实源）**：`/Users/leon/Code/hutui/docs/design.md`
 - 本项目定名与本会话结论：`/Users/leon/Code/leon-claw/workspace/memory/2026-10-15-hutui-zhihu-terminal-codex-skin.md`
 - 前序可行性评估（油猴脚本拆解 + 知乎移植分析）：`/Users/leon/Code/leon-claw/workspace/memory/2026-09-23-nga-codex-zhihu-disguise-feasibility.md`
