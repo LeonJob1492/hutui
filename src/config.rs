@@ -11,6 +11,10 @@ pub const APP_TITLE: &str = "handler.rs — gateway";
 pub const FEED_TARGET: usize = 42;
 /// 推荐流最多跟几页（每页 6 条）
 pub const FEED_MAX_PAGES: usize = 12;
+/// 触底续拉时一次多要多少条
+pub const FEED_MORE_HINT: usize = 24;
+/// 推荐流列表的硬上限，防止无限堆积
+pub const FEED_HARD_MAX: usize = 300;
 /// 回答列表每页条数
 pub const ANSWERS_PAGE: usize = 20;
 /// 评论每页条数

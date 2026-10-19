@@ -42,6 +42,10 @@ pub enum Cmd {
     ResumeFeed {
         want: usize,
     },
+    /// 光标走到列表底部，接着往后拉
+    MoreFeed {
+        want: usize,
+    },
     /// a = 当前这条回答的权威内容，b = 该问题下的回答列表。
     /// `req` 是打开序号：旧序号的事件到主线程后会被丢掉。
     OpenAnswer {

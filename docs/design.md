@@ -152,7 +152,8 @@ window.fetch 是原生函数（/[native code]/），知乎没有 patch 它
 启动 ──► 工作线程: ensure Chrome → 建知乎页 → 轮询 location.origin 直到是 zhihu.com
                     → 跟 paging.next 取推荐流（首屏 6 条，最多 12 页）
 
-列表  ↑↓ / j k 选择      → / Enter 打开      r 重拉      q / Ctrl-C 退出
+列表  ↑↓ / j k 选择      → / Enter 打开      空格 / r 整份重拉      q / Ctrl-C 退出
+      光标离底部还有 4 条时自动续拉；服务端不再给新条目就标记到底，不再反复请求
 
 打开  → 立刻用手里的正文秒开（零延迟）
        ├─ a: fetch /api/v4/answers/{aid}      → 用权威正文覆盖当前条

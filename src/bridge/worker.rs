@@ -21,6 +21,7 @@ fn op_name(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::LoadFeed { .. } => "LoadFeed",
         Cmd::ResumeFeed { .. } => "ResumeFeed",
+        Cmd::MoreFeed { .. } => "MoreFeed",
         Cmd::OpenAnswer { .. } => "OpenAnswer",
         Cmd::Vote { .. } => "Vote",
         Cmd::Favorite { .. } => "Favorite",
@@ -75,12 +76,14 @@ pub fn run(rx: Receiver<Queued>, tx: Sender<Event>) {
         let action = action_key(&job.cmd);
         let result = match job.cmd {
             Cmd::LoadFeed { want } => {
-                // 用户主动刷新：丢掉旧的续作状态
-                ctx.feed_resume = None;
-                ctx.feed_acc.clear();
-                ctx.load_feed(&tx, &rx, &mut backlog, want)
+                // 用户主动刷新：从第一页重来
+                ctx.feed_all.clear();
+                ctx.feed_next = Some(FEED_URL.to_string());
+                ctx.pull_feed(&tx, &rx, &mut backlog, want)
             }
-            Cmd::ResumeFeed { want } => ctx.load_feed(&tx, &rx, &mut backlog, want),
+            Cmd::ResumeFeed { want } | Cmd::MoreFeed { want } => {
+                ctx.pull_feed(&tx, &rx, &mut backlog, want)
+            }
             Cmd::OpenAnswer { qid, aid, req } => {
                 ctx.open_answer(&tx, &rx, &mut backlog, &qid, &aid, req)
             }
@@ -108,10 +111,10 @@ struct Ctx {
     session: Option<String>,
     /// 默认收藏夹 id，懒加载后缓存
     collection: Option<String>,
-    /// 被打断时存下的「下一页 URL」，续作从这里接着拉
-    feed_resume: Option<String>,
-    /// 被打断时已经拉到的条目，续作要在它之上继续累加
-    feed_acc: Vec<AnswerItem>,
+    /// 已经拉到的推荐流（对外整份发出去，主线程直接替换）
+    feed_all: Vec<AnswerItem>,
+    /// 下一页 URL；None 表示还没开始或者已经到底
+    feed_next: Option<String>,
 }
 
 /// include 参数里的方括号星号要转义
@@ -300,44 +303,58 @@ impl Ctx {
 
     // ---------------------------------------------------------------- 读
 
-    fn load_feed(
+    /// 从 `feed_next` 继续往后拉，直到够 `want` 条或没有下一页。
+    /// `LoadFeed` 会先把 cursor 重置到第一页，`MoreFeed` / `ResumeFeed` 直接续。
+    fn pull_feed(
         &mut self,
         tx: &Sender<Event>,
         rx: &Receiver<Queued>,
         backlog: &mut VecDeque<Queued>,
         want: usize,
     ) -> Result<()> {
-        self.ensure(tx)?;
-
-        let (mut acc, mut url) = match self.feed_resume.take() {
-            Some(next) => (std::mem::take(&mut self.feed_acc), next),
-            None => (Vec::new(), FEED_URL.to_string()),
+        let Some(mut url) = self.feed_next.clone() else {
+            // 已经到底了，别再请求
+            let _ = tx.send(Event::Status("no more items".into()));
+            return Ok(());
         };
-        let _ = tx.send(Event::Status(if acc.is_empty() {
+
+        self.ensure(tx)?;
+        let _ = tx.send(Event::Status(if self.feed_all.is_empty() {
             "fetching feed…".into()
         } else {
-            "resuming feed…".into()
+            "loading more…".into()
         }));
 
         for _ in 0..config::FEED_MAX_PAGES {
             let v = self.fetch(&url)?;
             let items = parse::parse_feed_page(&v);
             if items.is_empty() {
+                self.feed_next = None;
                 break;
             }
-            append_unique(&mut acc, items);
-            let _ = tx.send(Event::Feed(acc.clone()));
-            trace::log(&format!("feed n={} want={want}", acc.len()));
-            if acc.len() >= want {
+
+            let before = self.feed_all.len();
+            let mut batch = Vec::new();
+            append_unique(&mut batch, items);
+            append_unique(&mut self.feed_all, batch);
+            let grew = self.feed_all.len() > before;
+
+            let _ = tx.send(Event::Feed(self.feed_all.clone()));
+            trace::log(&format!(
+                "feed n={} grew={grew} want={want}",
+                self.feed_all.len()
+            ));
+
+            let next = parse::next_page_url(&v);
+            if self.feed_all.len() >= want || next.is_none() {
+                self.feed_next = next;
                 break;
             }
-            let Some(next) = parse::next_page_url(&v) else {
-                break;
-            };
+            let next = next.expect("上面判过 none");
+
             if self.service(tx, rx, backlog) {
-                // 让路：把「从 next 接着拉」放回队列尾部，等前面的事做完再继续
-                self.feed_resume = Some(next);
-                self.feed_acc = acc;
+                // 让路：记住 cursor，把续作放回队列尾，等前面的事做完再接着拉
+                self.feed_next = Some(next);
                 backlog.push_back(Queued {
                     cmd: Cmd::ResumeFeed { want },
                     at: Instant::now(),
@@ -348,9 +365,7 @@ impl Ctx {
             url = next;
         }
 
-        self.feed_resume = None;
-        self.feed_acc.clear();
-        let _ = tx.send(Event::Status(format!("{} items", acc.len())));
+        let _ = tx.send(Event::Status(format!("{} items", self.feed_all.len())));
         Ok(())
     }
 

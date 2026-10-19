@@ -53,6 +53,10 @@ pub struct App {
     pub list_offset: usize,
     pub list_above: usize,
     pub list_below: usize,
+    /// 已经发过一次"再拉一页"的请求，等结果
+    feed_requested: bool,
+    /// 后端已经把推荐流拉到底了，别再问
+    feed_exhausted: bool,
     /// 看过的条目
     pub read: ReadLog,
 
@@ -96,6 +100,8 @@ impl App {
             list_offset: 0,
             list_above: 0,
             list_below: 0,
+            feed_requested: false,
+            feed_exhausted: false,
             read: ReadLog::load(),
             stream: Vec::new(),
             index: 0,
@@ -169,16 +175,18 @@ impl App {
                 if self.cursor + 1 < self.feed.len() {
                     self.cursor += 1;
                 }
+                // 走到末尾附近就接着拉，别让列表停在半截
+                self.maybe_more_feed();
             }
             KeyCode::Home => self.cursor = 0,
-            KeyCode::End => self.cursor = self.feed.len().saturating_sub(1),
-            KeyCode::Right | KeyCode::Enter => self.open_reading(),
-            KeyCode::Char('r') => {
-                self.status = "refreshing…".into();
-                let _ = self.tx.send(Cmd::LoadFeed {
-                    want: config::FEED_TARGET,
-                });
+            KeyCode::End => {
+                self.cursor = self.feed.len().saturating_sub(1);
+                self.maybe_more_feed();
             }
+            // 空格：整份重新拉
+            KeyCode::Char(' ') => self.refresh_feed(),
+            KeyCode::Right | KeyCode::Enter => self.open_reading(),
+            KeyCode::Char('r') => self.refresh_feed(),
             KeyCode::Char('q') => self.quit = true,
             _ => {}
         }
@@ -258,6 +266,36 @@ impl App {
             vote: item.my_vote,
             voteup: item.voteup,
             faved: false,
+        });
+    }
+
+    /// 空格 / r：整份重新拉
+    fn refresh_feed(&mut self) {
+        self.feed_requested = false;
+        self.feed_exhausted = false;
+        self.status = "refreshing…".into();
+        let _ = self.tx.send(Cmd::LoadFeed {
+            want: config::FEED_TARGET,
+        });
+    }
+
+    /// 光标接近底部时续拉；到底或正在拉就跳过
+    fn maybe_more_feed(&mut self) {
+        if self.feed_exhausted || self.feed_requested || self.feed.is_empty() {
+            return;
+        }
+        if self.feed.len() >= config::FEED_HARD_MAX {
+            self.feed_exhausted = true;
+            return;
+        }
+        // 离底部还有 4 条就开始预取，滚到末端时通常已经到了
+        if self.cursor + 4 < self.feed.len() {
+            return;
+        }
+        self.feed_requested = true;
+        self.status = "loading more…".into();
+        let _ = self.tx.send(Cmd::MoreFeed {
+            want: self.feed.len() + config::FEED_MORE_HINT,
         });
     }
 
@@ -574,8 +612,14 @@ impl App {
             BridgeEvent::Status(s) => self.status = s,
 
             BridgeEvent::Feed(items) => {
+                let grew = items.len() > self.feed.len();
                 let anchor = self.feed.get(self.cursor).map(|x| x.id.clone());
                 self.feed = items;
+                // 是我们主动要的续拉、而且一条新的都没有 → 到底了
+                if self.feed_requested && !grew {
+                    self.feed_exhausted = true;
+                }
+                self.feed_requested = false;
                 // 按 id 找回原来那条，找不到就回顶部
                 self.cursor = anchor
                     .and_then(|id| self.feed.iter().position(|x| x.id == id))
@@ -861,6 +905,51 @@ mod tests {
         a.page_up_or_prev();
         assert_eq!(a.index, 0);
         assert_eq!(a.scroll, last);
+    }
+
+    /// 列表见底要自动续拉；没有再新增就认为到底，不再反复请求
+    #[test]
+    fn feed_loads_more_near_bottom() {
+        let mut a = app("more");
+        a.feed = (0..10).map(|i| item(&format!("i{i}"))).collect();
+
+        a.cursor = 0;
+        a.maybe_more_feed();
+        assert!(!a.feed_requested, "离底部还远，不该预取");
+
+        a.cursor = 8;
+        a.maybe_more_feed();
+        assert!(a.feed_requested, "接近底部要预取");
+
+        // 服务端给了新条目 → 恢复
+        a.on_bridge(BridgeEvent::Feed(
+            (0..16).map(|i| item(&format!("i{i}"))).collect(),
+        ));
+        assert!(!a.feed_requested);
+        assert!(!a.feed_exhausted);
+
+        // 再要一次，但这次一条新的都没有 → 到底
+        a.cursor = 15;
+        a.maybe_more_feed();
+        assert!(a.feed_requested);
+        a.on_bridge(BridgeEvent::Feed(
+            (0..16).map(|i| item(&format!("i{i}"))).collect(),
+        ));
+        assert!(a.feed_exhausted, "没有新增就认为到底");
+
+        a.maybe_more_feed();
+        assert!(!a.feed_requested, "到底之后不再请求");
+    }
+
+    /// 空格 = 整份刷新，并清掉"到底"标记
+    #[test]
+    fn space_refreshes_feed() {
+        let mut a = app("space");
+        a.feed = vec![item("a")];
+        a.feed_exhausted = true;
+        a.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::NONE));
+        assert_eq!(a.status, "refreshing…");
+        assert!(!a.feed_exhausted, "刷新要清掉到底标记");
     }
 
     /// 点赞/收藏是乐观更新：按键当下就变，失败再回滚
