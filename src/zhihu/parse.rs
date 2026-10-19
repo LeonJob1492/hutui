@@ -1,4 +1,4 @@
-use super::{AnswerItem, Comment};
+use super::{AnswerItem, Comment, Vote};
 use serde_json::Value;
 
 // ---------------------------------------------------------------- JSON 取值
@@ -47,6 +47,11 @@ fn entity_to_item(t: &Value) -> Option<AnswerItem> {
         excerpt,
         question_id: as_str(&q["id"]),
         question_title,
+        my_vote: match t["relationship"]["voting"].as_i64().unwrap_or(0) {
+            1 => Vote::Up,
+            -1 => Vote::Down,
+            _ => Vote::None,
+        },
     })
 }
 

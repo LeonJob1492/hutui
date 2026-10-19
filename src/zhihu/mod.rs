@@ -13,6 +13,8 @@ pub struct AnswerItem {
     pub excerpt: String,
     pub question_id: String,
     pub question_title: String,
+    /// 我对这条的表态，来自 relationship.voting
+    pub my_vote: Vote,
 }
 
 impl AnswerItem {

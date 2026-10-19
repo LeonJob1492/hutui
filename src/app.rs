@@ -240,6 +240,15 @@ impl App {
         self.stream.get(self.index)
     }
 
+    /// 把接口给的「我是否已赞」种进本地表态表；已有的不覆盖（本地操作优先）
+    fn seed_meta(&mut self, item: &AnswerItem) {
+        self.meta.entry(item.id.clone()).or_insert(AnswerMeta {
+            vote: item.my_vote,
+            voteup: item.voteup,
+            faved: false,
+        });
+    }
+
     fn open_reading(&mut self) {
         let Some(item) = self.feed.get(self.cursor).cloned() else {
             return;
@@ -252,6 +261,7 @@ impl App {
         self.view = View::Reading;
         self.resume = View::Reading;
         self.read.mark(&item.id);
+        self.seed_meta(&item);
         self.rebuild();
 
         if item.question_id.is_empty() {
@@ -457,6 +467,7 @@ impl App {
             }
 
             BridgeEvent::Answer(item) => {
+                self.seed_meta(&item);
                 if let Some(slot) = self.stream.iter_mut().find(|x| x.id == item.id) {
                     *slot = item;
                 } else {
@@ -467,6 +478,9 @@ impl App {
             }
 
             BridgeEvent::Answers { items, total } => {
+                for it in &items {
+                    self.seed_meta(it);
+                }
                 self.total = total.max(items.len());
                 let cur_id = self
                     .stream
