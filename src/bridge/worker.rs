@@ -11,22 +11,50 @@ use crate::zhihu::{AnswerItem, Vote};
 
 const HOME: &str = "https://www.zhihu.com";
 const FEED_URL: &str = "https://www.zhihu.com/api/v3/feed/topstory/recommend?limit=10&desktop=true";
-const ANSWER_INCLUDE: &str = "content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
-const LIST_INCLUDE: &str =
-    "data[*].content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
+const ANSWER_INCLUDE: &str =
+    "content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
+const LIST_INCLUDE: &str = "data[*].content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
+
+/// 长任务在翻页间隙看一眼有没有新命令，有就提前收工，把新命令交回主循环。
+fn take_pending(rx: &Receiver<Cmd>) -> Option<Cmd> {
+    let mut last = None;
+    while let Ok(cmd) = rx.try_recv() {
+        last = Some(cmd);
+    }
+    last
+}
 
 pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
     let mut ctx = Ctx::default();
-    while let Ok(cmd) = rx.recv() {
+    let mut pending: Option<Cmd> = None;
+
+    loop {
+        let cmd = match pending.take() {
+            Some(cmd) => cmd,
+            None => match rx.recv() {
+                Ok(cmd) => cmd,
+                Err(_) => break,
+            },
+        };
+
         let result = match cmd {
-            Cmd::LoadFeed { want } => ctx.load_feed(&tx, want),
-            Cmd::OpenAnswer { qid, aid } => ctx.open_answer(&tx, &qid, &aid),
+            Cmd::LoadFeed { want } => ctx.load_feed(&tx, &rx, want),
+            Cmd::OpenAnswer { qid, aid, req } => ctx.open_answer(&tx, &rx, &qid, &aid, req),
             Cmd::Vote { aid, kind, vote } => ctx.vote(&tx, &aid, &kind, vote),
             Cmd::Favorite { aid, kind, on } => ctx.favorite(&tx, &aid, &kind, on),
             Cmd::Comments { aid, kind, offset } => ctx.comments(&tx, &aid, &kind, offset),
         };
-        if let Err(e) = result {
-            let _ = tx.send(Event::Error(format!("{e:#}")));
+
+        match result {
+            Ok(Some(next)) => pending = Some(next),
+            Ok(None) => {}
+            Err(e) => {
+                let _ = tx.send(Event::Error(format!("{e:#}")));
+                // 连接或目标已经死掉：清空会话，下一条命令会自动重连
+                if ctx.is_dead() {
+                    ctx.reset();
+                }
+            }
         }
     }
 }
@@ -66,23 +94,53 @@ fn content_type(kind: &str) -> &'static str {
 }
 
 impl Ctx {
+    fn is_dead(&self) -> bool {
+        self.cdp.as_ref().map_or(false, Cdp::is_dead)
+    }
+
+    fn reset(&mut self) {
+        self.cdp = None;
+        self.session = None;
+    }
+
     fn ensure(&mut self, tx: &Sender<Event>) -> Result<()> {
         if self.cdp.is_some() {
             return Ok(());
         }
 
-        let _ = tx.send(Event::Status("启动浏览器…".into()));
+        let _ = tx.send(Event::Status("booting browser…".into()));
         chrome::ensure(config::CDP_PORT)?;
 
-        let _ = tx.send(Event::Status("连接调试端口…".into()));
+        let _ = tx.send(Event::Status("attaching debugger…".into()));
         let mut cdp = Cdp::connect(config::CDP_PORT)?;
 
-        // 建一个知乎页当同源上下文：fetch 必须在 zhihu.com 源下才带得上 cookie
-        let created = cdp.call("Target.createTarget", json!({ "url": format!("{HOME}/") }), None)?;
-        let target_id = created["targetId"]
-            .as_str()
-            .ok_or_else(|| anyhow!("createTarget 没返回 targetId"))?
-            .to_string();
+        // 已经有知乎标签页就直接复用，避免每次启动都堆一个
+        let existing = cdp
+            .call("Target.getTargets", json!({}), None)
+            .ok()
+            .and_then(|v| {
+                v["targetInfos"].as_array().and_then(|arr| {
+                    arr.iter()
+                        .find(|t| {
+                            t["type"].as_str() == Some("page")
+                                && t["url"].as_str().map_or(false, |u| u.starts_with(HOME))
+                        })
+                        .and_then(|t| t["targetId"].as_str().map(str::to_string))
+                })
+            });
+
+        let target_id = match existing {
+            Some(id) => id,
+            None => {
+                let created =
+                    cdp.call("Target.createTarget", json!({ "url": format!("{HOME}/") }), None)?;
+                created["targetId"]
+                    .as_str()
+                    .ok_or_else(|| anyhow!("createTarget 没返回 targetId"))?
+                    .to_string()
+            }
+        };
+
         let attached = cdp.call(
             "Target.attachToTarget",
             json!({ "targetId": target_id, "flatten": true }),
@@ -101,7 +159,7 @@ impl Ctx {
     }
 
     fn wait_origin(&mut self, tx: &Sender<Event>) -> Result<()> {
-        let _ = tx.send(Event::Status("等待知乎页面就绪…".into()));
+        let _ = tx.send(Event::Status("waiting for session…".into()));
         let session = self
             .session
             .clone()
@@ -120,7 +178,7 @@ impl Ctx {
             }
             std::thread::sleep(Duration::from_millis(300));
         }
-        bail!("知乎页面在 25s 内没就绪，检查 profile 登录态")
+        bail!("浏览器 25s 内没就绪，检查 profile 登录态")
     }
 
     fn fetch(&mut self, url: &str) -> Result<serde_json::Value> {
@@ -143,9 +201,14 @@ impl Ctx {
 
     // ---------------------------------------------------------------- 读
 
-    fn load_feed(&mut self, tx: &Sender<Event>, want: usize) -> Result<()> {
+    fn load_feed(
+        &mut self,
+        tx: &Sender<Event>,
+        rx: &Receiver<Cmd>,
+        want: usize,
+    ) -> Result<Option<Cmd>> {
         self.ensure(tx)?;
-        let _ = tx.send(Event::Status("拉取推荐流…".into()));
+        let _ = tx.send(Event::Status("fetching feed…".into()));
 
         let mut acc: Vec<AnswerItem> = Vec::new();
         let mut url = FEED_URL.to_string();
@@ -161,6 +224,9 @@ impl Ctx {
             if acc.len() >= want {
                 break;
             }
+            if let Some(next) = take_pending(rx) {
+                return Ok(Some(next));
+            }
             match parse::next_page_url(&v) {
                 Some(next) => url = next,
                 None => break,
@@ -168,36 +234,48 @@ impl Ctx {
         }
 
         let _ = tx.send(Event::Status(format!("{} items", acc.len())));
-        Ok(())
+        Ok(None)
     }
 
-    fn open_answer(&mut self, tx: &Sender<Event>, qid: &str, aid: &str) -> Result<()> {
+    fn open_answer(
+        &mut self,
+        tx: &Sender<Event>,
+        rx: &Receiver<Cmd>,
+        qid: &str,
+        aid: &str,
+        req: u64,
+    ) -> Result<Option<Cmd>> {
         self.ensure(tx)?;
 
-        let _ = tx.send(Event::Status("拉取这条回答…".into()));
+        let _ = tx.send(Event::Status("fetching answer…".into()));
         let url = format!("{HOME}/api/v4/answers/{aid}?include={}", enc(ANSWER_INCLUDE));
         match self.fetch(&url) {
             Ok(v) => {
                 if let Some(item) = parse::parse_answer_entity(&v) {
-                    let _ = tx.send(Event::Answer(item));
+                    let _ = tx.send(Event::Answer { item, req });
                 }
             }
             Err(e) => {
-                let _ = tx.send(Event::Status(format!("这条回答取不到：{e}")));
+                let _ = tx.send(Event::Status(format!("answer unavailable: {e}")));
             }
         }
 
         if qid.is_empty() {
-            let _ = tx.send(Event::Status("这条没有所属问题".into()));
-            return Ok(());
+            let _ = tx.send(Event::Status("no parent thread".into()));
+            return Ok(None);
         }
 
-        let _ = tx.send(Event::Status("拉取同问题回答…".into()));
+        let _ = tx.send(Event::Status("fetching siblings…".into()));
         let mut acc: Vec<AnswerItem> = Vec::new();
         let mut offset = 0usize;
         let limit = config::ANSWERS_PAGE;
 
         let total = loop {
+            // 用户在翻页间隙又打开了别的东西：立刻让路
+            if let Some(next) = take_pending(rx) {
+                return Ok(Some(next));
+            }
+
             let url = format!(
                 "{HOME}/api/v4/questions/{qid}/answers?include={}&offset={offset}&limit={limit}&order=default&platform=desktop",
                 enc(LIST_INCLUDE)
@@ -212,17 +290,24 @@ impl Ctx {
             let _ = tx.send(Event::Answers {
                 items: acc.clone(),
                 total,
+                req,
             });
             if is_end || acc.len() >= config::STREAM_MAX {
                 break total;
             }
         };
 
-        let _ = tx.send(Event::Status(format!("{total} 条回答")));
-        Ok(())
+        let _ = tx.send(Event::Status(format!("{total} answers")));
+        Ok(None)
     }
 
-    fn comments(&mut self, tx: &Sender<Event>, aid: &str, kind: &str, offset: usize) -> Result<()> {
+    fn comments(
+        &mut self,
+        tx: &Sender<Event>,
+        aid: &str,
+        kind: &str,
+        offset: usize,
+    ) -> Result<Option<Cmd>> {
         self.ensure(tx)?;
         let url = format!(
             "{HOME}/api/v4/{0}/{aid}/comments?limit={1}&offset={offset}&order=normal",
@@ -238,14 +323,20 @@ impl Ctx {
             total,
             next_offset: next,
         });
-        Ok(())
+        Ok(None)
     }
 
     // ---------------------------------------------------------------- 写
 
-    fn vote(&mut self, tx: &Sender<Event>, aid: &str, kind: &str, vote: Vote) -> Result<()> {
+    fn vote(
+        &mut self,
+        tx: &Sender<Event>,
+        aid: &str,
+        kind: &str,
+        vote: Vote,
+    ) -> Result<Option<Cmd>> {
         self.ensure(tx)?;
-        let _ = tx.send(Event::Status("提交表态…".into()));
+        let _ = tx.send(Event::Status("sending…".into()));
 
         let url = format!("{HOME}/api/v4/{}/{aid}/voters", seg(kind));
         let body = format!("{{\"type\":\"{}\"}}", vote.as_api());
@@ -258,7 +349,7 @@ impl Ctx {
             vote,
             count,
         });
-        Ok(())
+        Ok(None)
     }
 
     fn default_collection(&mut self) -> Result<String> {
@@ -273,18 +364,23 @@ impl Ctx {
         let list = self.fetch(&format!(
             "{HOME}/api/v4/people/{token}/collections?offset=0&limit=20"
         ))?;
-        let id =
-            parse::parse_default_collection(&list).ok_or_else(|| anyhow!("找不到默认收藏夹"))?;
+        let id = parse::parse_default_collection(&list).ok_or_else(|| anyhow!("找不到默认收藏夹"))?;
         self.collection = Some(id.clone());
         Ok(id)
     }
 
-    fn favorite(&mut self, tx: &Sender<Event>, aid: &str, kind: &str, on: bool) -> Result<()> {
+    fn favorite(
+        &mut self,
+        tx: &Sender<Event>,
+        aid: &str,
+        kind: &str,
+        on: bool,
+    ) -> Result<Option<Cmd>> {
         self.ensure(tx)?;
         let _ = tx.send(Event::Status(if on {
-            "收藏…".into()
+            "saving…".into()
         } else {
-            "取消收藏…".into()
+            "removing…".into()
         }));
 
         if on {
@@ -307,7 +403,7 @@ impl Ctx {
             aid: aid.to_string(),
             on,
         });
-        Ok(())
+        Ok(None)
     }
 }
 

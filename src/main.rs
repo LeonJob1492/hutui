@@ -31,10 +31,18 @@ fn run(
     ev_rx: &Receiver<bridge::Event>,
 ) -> Result<()> {
     loop {
-        terminal.draw(|f| ui::draw(f, app))?;
+        // 只在有变化时重绘：闲下来就完全不碰终端
+        if app.dirty {
+            terminal.draw(|f| ui::draw(f, app))?;
+            app.dirty = false;
+        }
 
-        if let Some(key) = term::poll_key(Duration::from_millis(110))? {
-            app.on_key(key);
+        if let Some(ev) = term::poll_event(Duration::from_millis(120))? {
+            match ev {
+                crossterm::event::Event::Key(key) => app.on_key(key),
+                crossterm::event::Event::Resize(_, _) => app.on_resize(),
+                _ => {}
+            }
         }
         while let Ok(ev) = ev_rx.try_recv() {
             app.on_bridge(ev);

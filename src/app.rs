@@ -75,6 +75,12 @@ pub struct App {
 
     pub status: String,
     pub quit: bool,
+    /// 需要重绘（只在有变化时才重绘，避免闲时空转）
+    pub dirty: bool,
+    /// 打开序号：旧序号的后台事件直接丢弃
+    req: u64,
+    /// 进行中的写操作，key 形如 "aid:v" / "aid:f"，防止连按重复提交
+    pending: std::collections::HashSet<String>,
     last_esc: Option<Instant>,
     tx: Sender<Cmd>,
 }
@@ -100,8 +106,11 @@ impl App {
             comments: CommentsState::default(),
             built_width: 0,
             body_h: 0,
-            status: "连接中…".into(),
+            status: "connecting…".into(),
             quit: false,
+            dirty: true,
+            req: 0,
+            pending: std::collections::HashSet::new(),
             last_esc: None,
             tx,
         }
@@ -110,6 +119,7 @@ impl App {
     // ------------------------------------------------------------- 按键
 
     pub fn on_key(&mut self, k: KeyEvent) {
+        self.dirty = true;
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
 
         if ctrl && matches!(k.code, KeyCode::Char('c')) {
@@ -143,10 +153,8 @@ impl App {
         self.last_esc = None;
 
         match self.view {
-            View::Panic => {
-                self.view = self.resume;
-                self.rebuild();
-            }
+            // 应急画面下不响应任何普通键：手一抖按到空格/q 不应该把正文请回来
+            View::Panic => {}
             View::List => self.on_key_list(k),
             View::Reading => self.on_key_reading(k),
             View::Comments => self.on_key_comments(k),
@@ -165,7 +173,7 @@ impl App {
             KeyCode::End => self.cursor = self.feed.len().saturating_sub(1),
             KeyCode::Right | KeyCode::Enter => self.open_reading(),
             KeyCode::Char('r') => {
-                self.status = "刷新…".into();
+                self.status = "refreshing…".into();
                 let _ = self.tx.send(Cmd::LoadFeed {
                     want: config::FEED_TARGET,
                 });
@@ -266,13 +274,15 @@ impl App {
         self.rebuild();
 
         if item.question_id.is_empty() {
-            self.status = "单篇".into();
+            self.status = "single".into();
         } else {
-            self.status = "拉取回答…".into();
+            self.status = "loading…".into();
         }
+        self.req = self.req.wrapping_add(1);
         let _ = self.tx.send(Cmd::OpenAnswer {
             qid: item.question_id.clone(),
             aid: item.id.clone(),
+            req: self.req,
         });
     }
 
@@ -295,11 +305,7 @@ impl App {
             (self.index + delta as usize).min(self.stream.len() - 1)
         };
         if next == self.index {
-            self.status = if delta < 0 {
-                "已是第一条".into()
-            } else {
-                "已是最后一条".into()
-            };
+            self.status = if delta < 0 { "top".into() } else { "bottom".into() };
             return;
         }
         self.index = next;
@@ -309,29 +315,40 @@ impl App {
 
     /// z = 赞，v = 反对；再按同一个键就取消
     fn toggle_vote(&mut self, target: Vote) {
-        let Some(item) = self.current() else { return };
-        let cur = self
-            .meta
-            .get(&item.id)
-            .map(|m| m.vote)
-            .unwrap_or(item.my_vote);
+        let Some((aid, kind, my_vote)) = self
+            .current()
+            .map(|i| (i.id.clone(), i.kind.clone(), i.my_vote))
+        else {
+            return;
+        };
+        let key = format!("{aid}:v");
+        if self.pending.contains(&key) {
+            self.status = "sending…".into();
+            return;
+        }
+        let cur = self.meta.get(&aid).map(|m| m.vote).unwrap_or(my_vote);
         let next = if cur == target { Vote::None } else { target };
+        self.pending.insert(key);
         let _ = self.tx.send(Cmd::Vote {
-            aid: item.id.clone(),
-            kind: item.kind.clone(),
+            aid,
+            kind,
             vote: next,
         });
     }
 
     /// c：收藏（已收藏则取消）
     fn toggle_fav(&mut self) {
-        let Some(item) = self.current() else { return };
-        let on = !self.meta.get(&item.id).map(|m| m.faved).unwrap_or(false);
-        let _ = self.tx.send(Cmd::Favorite {
-            aid: item.id.clone(),
-            kind: item.kind.clone(),
-            on,
-        });
+        let Some((aid, kind)) = self.current().map(|i| (i.id.clone(), i.kind.clone())) else {
+            return;
+        };
+        let key = format!("{aid}:f");
+        if self.pending.contains(&key) {
+            self.status = "sending…".into();
+            return;
+        }
+        let on = !self.meta.get(&aid).map(|m| m.faved).unwrap_or(false);
+        self.pending.insert(key);
+        let _ = self.tx.send(Cmd::Favorite { aid, kind, on });
     }
 
     /// x：评论区
@@ -381,6 +398,12 @@ impl App {
     }
 
     // ------------------------------------------------------------- 布局
+
+    /// 终端尺寸变了：清掉已构建宽度，下一帧强制重建
+    pub fn on_resize(&mut self) {
+        self.built_width = 0;
+        self.dirty = true;
+    }
 
     pub fn ensure_layout(&mut self, width: u16) {
         if self.built_width != width {
@@ -456,18 +479,25 @@ impl App {
     // ------------------------------------------------------------- 桥接事件
 
     pub fn on_bridge(&mut self, ev: BridgeEvent) {
+        self.dirty = true;
         match ev {
             BridgeEvent::Status(s) => self.status = s,
 
             BridgeEvent::Feed(items) => {
+                let anchor = self.feed.get(self.cursor).map(|x| x.id.clone());
                 self.feed = items;
-                if self.cursor >= self.feed.len() {
-                    self.cursor = self.feed.len().saturating_sub(1);
-                }
+                // 按 id 找回原来那条，找不到就回顶部
+                self.cursor = anchor
+                    .and_then(|id| self.feed.iter().position(|x| x.id == id))
+                    .unwrap_or(0);
+                self.list_offset = 0;
                 self.status = format!("{} items", self.feed.len());
             }
 
-            BridgeEvent::Answer(item) => {
+            BridgeEvent::Answer { item, req } => {
+                if req != self.req {
+                    return;
+                }
                 self.seed_meta(&item);
                 if let Some(slot) = self.stream.iter_mut().find(|x| x.id == item.id) {
                     *slot = item;
@@ -478,7 +508,10 @@ impl App {
                 self.rebuild();
             }
 
-            BridgeEvent::Answers { items, total } => {
+            BridgeEvent::Answers { items, total, req } => {
+                if req != self.req {
+                    return;
+                }
                 for it in &items {
                     self.seed_meta(it);
                 }
@@ -504,28 +537,26 @@ impl App {
                     .unwrap_or(0);
                 self.scroll = scroll;
                 self.rebuild();
-                self.status = format!("{} 条回答", self.total);
+                self.status = format!("{} answers", self.total);
             }
 
             BridgeEvent::Voted { aid, vote, count } => {
-                let m = self.meta.entry(aid).or_default();
+                let m = self.meta.entry(aid.clone()).or_default();
                 m.vote = vote;
                 m.voteup = count;
+                self.pending.remove(&format!("{aid}:v"));
                 self.status = match vote {
-                    Vote::Up => format!("已赞 · {count}"),
-                    Vote::Down => format!("已反对 · {count}"),
-                    Vote::None => "已取消赞同".into(),
+                    Vote::Up => format!("voted · {count}"),
+                    Vote::Down => format!("downvoted · {count}"),
+                    Vote::None => "vote cleared".into(),
                 };
                 self.rebuild();
             }
 
             BridgeEvent::Faved { aid, on } => {
+                self.pending.remove(&format!("{aid}:f"));
                 self.meta.entry(aid).or_default().faved = on;
-                self.status = if on {
-                    "已收藏".into()
-                } else {
-                    "已取消收藏".into()
-                };
+                self.status = if on { "saved".into() } else { "unsaved".into() };
                 self.rebuild();
             }
 
@@ -546,10 +577,86 @@ impl App {
                     self.comments.loading = false;
                     self.rebuild_comments();
                 }
-                self.status = format!("{} 条评论", total);
+                self.status = format!("{total} comments");
             }
 
-            BridgeEvent::Error(e) => self.status = format!("× {e}"),
+            BridgeEvent::Error(e) => {
+                // 失败也要解除"加载中"，否则评论区会永久卡死
+                self.comments.loading = false;
+                self.pending.clear();
+                self.status = format!("× {e}");
+            }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::ReadLog;
+
+    fn app() -> App {
+        let (tx, _rx) = std::sync::mpsc::channel();
+        let mut a = App::new(tx);
+        // 别碰真实的家目录
+        a.read = ReadLog::load_from(std::path::PathBuf::from("/tmp/hutui-test-read.json"));
+        a
+    }
+
+    fn item(id: &str) -> AnswerItem {
+        AnswerItem {
+            id: id.into(),
+            content: "body".into(),
+            ..Default::default()
+        }
+    }
+
+    /// 修 bug 1：旧编号的 Answers 不能覆盖新打开的那篇
+    #[test]
+    fn stale_answers_are_dropped() {
+        let mut a = app();
+        a.feed = vec![item("a")];
+        a.open_reading(); // req -> 1，stream = [a]
+        let req_now = a.req;
+
+        a.on_bridge(BridgeEvent::Answers {
+            items: vec![item("stale-1"), item("stale-2")],
+            total: 9,
+            req: req_now - 1,
+        });
+        assert_eq!(a.stream.len(), 1, "旧编号的列表必须被丢掉");
+
+        a.on_bridge(BridgeEvent::Answers {
+            items: vec![item("fresh")],
+            total: 9,
+            req: req_now,
+        });
+        assert!(a.stream.iter().any(|x| x.id == "fresh"));
+    }
+
+    /// 修 bug 5：应急画面下按键不能把正文请回来
+    #[test]
+    fn panic_swallows_plain_keys() {
+        let mut a = app();
+        a.feed = vec![item("a")];
+        a.open_reading();
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(a.view, View::Panic);
+
+        for k in [KeyCode::Char('q'), KeyCode::Char(' '), KeyCode::Enter, KeyCode::Down] {
+            a.on_key(KeyEvent::new(k, KeyModifiers::NONE));
+            assert_eq!(a.view, View::Panic, "{k:?} 不该能关掉应急画面");
+        }
+        assert!(!a.quit);
+    }
+
+    /// 修 bug 2：请求失败后 comments.loading 必须解锁
+    #[test]
+    fn comment_error_unlocks_loading() {
+        let mut a = app();
+        a.comments.loading = true;
+        a.on_bridge(BridgeEvent::Error("boom".into()));
+        assert!(!a.comments.loading);
     }
 }

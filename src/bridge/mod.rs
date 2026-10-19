@@ -11,10 +11,12 @@ pub enum Cmd {
     LoadFeed {
         want: usize,
     },
-    /// a = 当前这条回答的权威内容，b = 该问题下的回答列表
+    /// a = 当前这条回答的权威内容，b = 该问题下的回答列表。
+    /// `req` 是打开序号：旧序号的事件到主线程后会被丢掉。
     OpenAnswer {
         qid: String,
         aid: String,
+        req: u64,
     },
     Vote {
         aid: String,
@@ -39,11 +41,15 @@ pub enum Event {
     Status(String),
     Feed(Vec<AnswerItem>),
     /// 当前这条回答
-    Answer(AnswerItem),
+    Answer {
+        item: AnswerItem,
+        req: u64,
+    },
     /// 该问题下的回答列表（增量）
     Answers {
         items: Vec<AnswerItem>,
         total: usize,
+        req: u64,
     },
     Voted {
         aid: String,

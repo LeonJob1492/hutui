@@ -64,7 +64,12 @@ pub fn build(
         Vote::None => {}
     }
     if faved {
-        spans.push(Span::styled("  ·  已收藏", meta_style));
+        spans.push(Span::styled(
+            "  ★",
+            Style::default()
+                .fg(theme::META)
+                .add_modifier(Modifier::BOLD),
+        ));
     }
     if !when.is_empty() {
         spans.push(Span::styled(format!("  ·  {when}"), meta_style));

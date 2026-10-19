@@ -1,7 +1,7 @@
 use anyhow::Result;
 use crossterm::{
     cursor,
-    event::{self, KeyEvent},
+    event::{self},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -54,19 +54,10 @@ pub fn restore() -> Result<()> {
     Ok(())
 }
 
-/// 等一个按键（非按键事件丢弃）
-pub fn poll_key(timeout: Duration) -> Result<Option<KeyEvent>> {
+/// 等一个终端事件（按键、尺寸变化…），超时返回 None
+pub fn poll_event(timeout: Duration) -> Result<Option<event::Event>> {
     if !event::poll(timeout)? {
         return Ok(None);
     }
-    loop {
-        match event::read()? {
-            event::Event::Key(k) => return Ok(Some(k)),
-            _ => {
-                if !event::poll(Duration::from_millis(5))? {
-                    return Ok(None);
-                }
-            }
-        }
-    }
+    Ok(Some(event::read()?))
 }

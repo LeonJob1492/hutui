@@ -16,6 +16,8 @@ pub struct Cdp {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
     next_id: u64,
     responses: HashMap<u64, Value>,
+    /// 连接或目标已死，需要上层重建会话
+    dead: bool,
 }
 
 fn discover_ws_url(port: u16) -> Result<String> {
@@ -82,7 +84,12 @@ impl Cdp {
             ws,
             next_id: 0,
             responses: HashMap::new(),
+            dead: false,
         })
+    }
+
+    pub fn is_dead(&self) -> bool {
+        self.dead
     }
 
     fn push(&mut self, method: &str, params: Value, session: Option<&str>) -> Result<u64> {
@@ -118,13 +125,22 @@ impl Cdp {
                         self.absorb(&owned);
                     }
                 }
-                Ok(Message::Close(_)) => bail!("CDP 连接被对端关闭"),
+                Ok(Message::Close(_)) => {
+                    self.dead = true;
+                    bail!("CDP 连接被对端关闭")
+                }
                 Ok(_) => {}
                 Err(tungstenite::Error::Io(e))
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut => {}
-                Err(tungstenite::Error::ConnectionClosed) => bail!("CDP 连接已断开"),
-                Err(e) => return Err(e.into()),
+                Err(tungstenite::Error::ConnectionClosed) => {
+                    self.dead = true;
+                    bail!("CDP 连接已断开")
+                }
+                Err(e) => {
+                    self.dead = true;
+                    return Err(e.into())
+                }
             }
         }
         Ok(())
@@ -136,6 +152,20 @@ impl Cdp {
         loop {
             if let Some(v) = self.responses.remove(&id) {
                 if let Some(err) = v.get("error") {
+                    let text = err.to_string();
+                    // 标签页被关、会话失效这类错误：标记成死，交给上层重连
+                    for marker in [
+                        "Target closed",
+                        "Session with given id not found",
+                        "Inspected target navigated or closed",
+                        "No target with given id",
+                        "Not attached to an active page",
+                    ] {
+                        if text.contains(marker) {
+                            self.dead = true;
+                            break;
+                        }
+                    }
                     bail!("CDP {method} 出错: {err}");
                 }
                 return Ok(v.get("result").cloned().unwrap_or(Value::Null));
