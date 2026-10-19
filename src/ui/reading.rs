@@ -121,7 +121,8 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
     let height = area.height as usize;
-    let max = app.lines.len().saturating_sub(height);
+    // 按页对齐的上限钳制，别把最后一页按回"半屏重叠"的位置
+    let max = app.last_page_start();
     if app.scroll > max {
         app.scroll = max;
     }

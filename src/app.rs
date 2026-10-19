@@ -200,7 +200,7 @@ impl App {
             KeyCode::PageUp => self.page_only(false),
             KeyCode::PageDown => self.page_only(true),
             KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = self.max_scroll(),
+            KeyCode::End => self.scroll = self.last_page_start(),
             KeyCode::Left | KeyCode::Backspace => self.back_to_list(),
             KeyCode::Char('q') => self.quit = true,
             _ => {}
@@ -309,9 +309,12 @@ impl App {
             return;
         }
         self.index = next;
-        // 往下切落到新一条的顶部；往上切落到它的底部，接着往上翻很自然
-        self.scroll = if delta < 0 { usize::MAX } else { 0 };
+        self.scroll = 0;
         self.rebuild();
+        // 往下切落到顶部；往上切落到上一条最后一页的起点，接着往上翻很自然
+        if delta < 0 {
+            self.scroll = self.last_page_start();
+        }
     }
 
     /// z = 赞，v = 反对；再按同一个键就取消。
@@ -427,12 +430,23 @@ impl App {
         });
     }
 
-    fn max_scroll(&self) -> usize {
-        self.lines.len().saturating_sub(self.body_h as usize)
-    }
-
     fn page(&self) -> usize {
         (self.body_h as usize).max(1)
+    }
+
+    /// 最后一页的起始行，按整屏对齐。
+    ///
+    /// 不能直接用 `max_scroll`（总行数 − 屏高）：那会让最后一页只前进几行，
+    /// 上一页的尾巴又重复出现一次。对齐后每一步都严格等于一屏，代价是末页
+    /// 底下留白——这比"翻了半屏"好判断。
+    pub fn last_page_start(&self) -> usize {
+        let page = self.page();
+        let total = self.lines.len();
+        if total <= page {
+            0
+        } else {
+            ((total - 1) / page) * page
+        }
     }
 
     /// ↑：还在本条中间就先往回翻一屏，翻到顶才换上一条
@@ -444,10 +458,10 @@ impl App {
         }
     }
 
-    /// ↓：还有下文就先翻一屏，翻到底才换下一条
+    /// ↓：还有整屏可翻就先翻一屏，到最后一页才换下一条
     fn page_down_or_next(&mut self) {
-        if self.scroll < self.max_scroll() {
-            self.scroll = (self.scroll + self.page()).min(self.max_scroll());
+        if self.scroll < self.last_page_start() {
+            self.scroll = (self.scroll + self.page()).min(self.last_page_start());
         } else {
             self.step_answer(1);
         }
@@ -456,7 +470,7 @@ impl App {
     /// PgDn/PgUp：只在本条内翻屏，不换条
     fn page_only(&mut self, down: bool) {
         if down {
-            self.scroll = (self.scroll + self.page()).min(self.max_scroll());
+            self.scroll = (self.scroll + self.page()).min(self.last_page_start());
         } else {
             self.scroll = self.scroll.saturating_sub(self.page());
         }
@@ -492,7 +506,8 @@ impl App {
             .unwrap_or_default();
         self.header = header;
         self.lines = body;
-        let max = self.max_scroll();
+        // 页对齐的上限，避免末页被截成半屏
+        let max = self.last_page_start();
         if self.scroll > max {
             self.scroll = max;
         }
@@ -531,7 +546,7 @@ impl App {
             return None;
         }
         let pages = (total + page - 1) / page;
-        Some((self.scroll / page + 1, pages))
+        Some(((self.scroll / page) + 1, pages))
     }
 
     pub fn comment_progress(&self) -> Option<(usize, usize)> {
@@ -767,7 +782,7 @@ mod tests {
         // 反向：到顶再 ↑ 换上一条，并落在它的底部
         a.page_up_or_prev();
         assert_eq!(a.index, 0);
-        assert_eq!(a.scroll, a.max_scroll(), "往上切换落在上一条底部");
+        assert_eq!(a.scroll, a.last_page_start(), "往上切换落在上一条最后一页的起点");
     }
 
     /// PgUp/PgDn 只翻屏，不换条
@@ -787,13 +802,60 @@ mod tests {
             a.page_only(true);
         }
         assert_eq!(a.index, 0, "PgDn 不该换条");
-        assert_eq!(a.scroll, a.max_scroll());
+        assert_eq!(a.scroll, a.last_page_start());
 
         for _ in 0..50 {
             a.page_only(false);
         }
         assert_eq!(a.index, 0);
         assert_eq!(a.scroll, 0);
+    }
+
+    /// 翻屏必须整屏步进，末页不能只滚几行
+    #[test]
+    fn page_turns_cover_whole_screens() {
+        let mut a = app("fullpage");
+        let mut long = item("a");
+        long.content = "很长的一段话，用来撑出好几屏。".repeat(120);
+        let mut next = item("b");
+        next.content = long.content.clone();
+        a.stream = vec![long, next];
+        a.body_h = 10;
+        a.built_width = 40;
+        a.rebuild();
+
+        let page = a.page();
+        assert!(a.lines.len() > page * 3, "要够长才有好几页");
+        let last = a.last_page_start();
+        assert_eq!(last % page, 0, "末页起点必须整屏对齐");
+
+        // 一路 ↓ 到底，记录每次步进
+        let mut prev = a.scroll;
+        let mut steps: Vec<usize> = Vec::new();
+        loop {
+            a.page_down_or_next();
+            assert_eq!(a.index, 0, "还没到最后一页就不该换条");
+            steps.push(a.scroll - prev);
+            prev = a.scroll;
+            if a.scroll == last {
+                break;
+            }
+            assert!(steps.len() < 200, "步进卡住");
+        }
+        assert!(!steps.is_empty());
+        assert!(
+            steps.iter().all(|d| *d == page),
+            "每一步都必须正好一屏，实际 {steps:?}"
+        );
+
+        // 已在最后一页 → 再按才换条
+        a.page_down_or_next();
+        assert_eq!(a.index, 1);
+
+        // 反向：回到上一条要落在它最后一页的起点
+        a.page_up_or_prev();
+        assert_eq!(a.index, 0);
+        assert_eq!(a.scroll, last);
     }
 
     /// 点赞/收藏是乐观更新：按键当下就变，失败再回滚
