@@ -511,6 +511,11 @@ impl App {
         if self.scroll > max {
             self.scroll = max;
         }
+        // 窗口高度变了之后也落回整屏边界，否则下一按会得到半屏
+        let page = self.page();
+        if page > 1 {
+            self.scroll -= self.scroll % page;
+        }
     }
 
     pub fn rebuild_comments(&mut self) {

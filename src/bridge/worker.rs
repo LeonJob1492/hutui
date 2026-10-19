@@ -20,6 +20,7 @@ const LIST_INCLUDE: &str = "data[*].content,excerpt,author,voteup_count,comment_
 fn op_name(cmd: &Cmd) -> &'static str {
     match cmd {
         Cmd::LoadFeed { .. } => "LoadFeed",
+        Cmd::ResumeFeed { .. } => "ResumeFeed",
         Cmd::OpenAnswer { .. } => "OpenAnswer",
         Cmd::Vote { .. } => "Vote",
         Cmd::Favorite { .. } => "Favorite",
@@ -29,6 +30,7 @@ fn op_name(cmd: &Cmd) -> &'static str {
 
 /// 只有「换内容」的命令才值得打断正在跑的长任务。
 fn supersedes(cmd: &Cmd) -> bool {
+    // ResumeFeed 是续作，不该再打断别人
     matches!(cmd, Cmd::OpenAnswer { .. } | Cmd::LoadFeed { .. })
 }
 
@@ -72,7 +74,13 @@ pub fn run(rx: Receiver<Queued>, tx: Sender<Event>) {
 
         let action = action_key(&job.cmd);
         let result = match job.cmd {
-            Cmd::LoadFeed { want } => ctx.load_feed(&tx, &rx, &mut backlog, want),
+            Cmd::LoadFeed { want } => {
+                // 用户主动刷新：丢掉旧的续作状态
+                ctx.feed_resume = None;
+                ctx.feed_acc.clear();
+                ctx.load_feed(&tx, &rx, &mut backlog, want)
+            }
+            Cmd::ResumeFeed { want } => ctx.load_feed(&tx, &rx, &mut backlog, want),
             Cmd::OpenAnswer { qid, aid, req } => {
                 ctx.open_answer(&tx, &rx, &mut backlog, &qid, &aid, req)
             }
@@ -86,10 +94,10 @@ pub fn run(rx: Receiver<Queued>, tx: Sender<Event>) {
                 msg: format!("{e:#}"),
                 action,
             });
-            // 连接或目标已经死掉：清空会话，下一条命令会自动重连
-            if ctx.is_dead() {
-                ctx.reset();
-            }
+        }
+        // 不管这条命令是自己失败还是就地执行的命令把连接搞挂了，都统一检查
+        if ctx.is_dead() {
+            ctx.reset();
         }
     }
 }
@@ -100,6 +108,10 @@ struct Ctx {
     session: Option<String>,
     /// 默认收藏夹 id，懒加载后缓存
     collection: Option<String>,
+    /// 被打断时存下的「下一页 URL」，续作从这里接着拉
+    feed_resume: Option<String>,
+    /// 被打断时已经拉到的条目，续作要在它之上继续累加
+    feed_acc: Vec<AnswerItem>,
 }
 
 /// include 参数里的方括号星号要转义
@@ -296,10 +308,16 @@ impl Ctx {
         want: usize,
     ) -> Result<()> {
         self.ensure(tx)?;
-        let _ = tx.send(Event::Status("fetching feed…".into()));
 
-        let mut acc: Vec<AnswerItem> = Vec::new();
-        let mut url = FEED_URL.to_string();
+        let (mut acc, mut url) = match self.feed_resume.take() {
+            Some(next) => (std::mem::take(&mut self.feed_acc), next),
+            None => (Vec::new(), FEED_URL.to_string()),
+        };
+        let _ = tx.send(Event::Status(if acc.is_empty() {
+            "fetching feed…".into()
+        } else {
+            "resuming feed…".into()
+        }));
 
         for _ in 0..config::FEED_MAX_PAGES {
             let v = self.fetch(&url)?;
@@ -309,18 +327,29 @@ impl Ctx {
             }
             append_unique(&mut acc, items);
             let _ = tx.send(Event::Feed(acc.clone()));
+            trace::log(&format!("feed n={} want={want}", acc.len()));
             if acc.len() >= want {
                 break;
             }
+            let Some(next) = parse::next_page_url(&v) else {
+                break;
+            };
             if self.service(tx, rx, backlog) {
+                // 让路：把「从 next 接着拉」放回队列尾部，等前面的事做完再继续
+                self.feed_resume = Some(next);
+                self.feed_acc = acc;
+                backlog.push_back(Queued {
+                    cmd: Cmd::ResumeFeed { want },
+                    at: Instant::now(),
+                });
+                trace::log("feed paused, resume queued");
                 return Ok(());
             }
-            match parse::next_page_url(&v) {
-                Some(next) => url = next,
-                None => break,
-            }
+            url = next;
         }
 
+        self.feed_resume = None;
+        self.feed_acc.clear();
         let _ = tx.send(Event::Status(format!("{} items", acc.len())));
         Ok(())
     }
@@ -381,6 +410,10 @@ impl Ctx {
                 total,
                 req,
             });
+            trace::log(&format!(
+                "answers req={req} n={} total={total} offset={offset}",
+                acc.len()
+            ));
             if is_end || acc.len() >= config::STREAM_MAX {
                 break;
             }
@@ -549,6 +582,25 @@ mod tests {
         assert!(matches!(b[1].cmd, Cmd::Comments { .. }));
         assert!(
             matches!(&b[2].cmd, Cmd::OpenAnswer { aid, req, .. } if aid == "y" && *req == 2)
+        );
+    }
+
+    /// 推荐流让路后，续作必须排在「打开回答」后面，且不能被合并掉
+    #[test]
+    fn resume_feed_queues_after_open() {
+        let mut b: VecDeque<Queued> = VecDeque::new();
+        push_cmd(&mut b, queued(open("a", 1)));
+        push_cmd(&mut b, queued(Cmd::ResumeFeed { want: 42 }));
+
+        assert_eq!(b.len(), 2, "续作不能被合并掉");
+        assert!(
+            matches!(b[0].cmd, Cmd::OpenAnswer { .. }),
+            "续作要排在打开之后，等它先完成"
+        );
+        assert!(matches!(b[1].cmd, Cmd::ResumeFeed { .. }));
+        assert!(
+            !supersedes(&Cmd::ResumeFeed { want: 42 }),
+            "续作本身不该再打断别人"
         );
     }
 

@@ -214,8 +214,11 @@ impl Cdp {
         let t_out = val["tout"].as_i64().unwrap_or(0);
         let t_recv = crate::trace::epoch_ms();
         let deliver = if t_out > 0 { t_recv - t_out } else { -1 };
+        let status = val["status"].as_i64().unwrap_or(-1);
+        let ok = val["ok"].as_bool().unwrap_or(false);
+        // status 一定要记：失败也是"一行漂亮的时间"，没有状态码就查不出来
         crate::trace::log(&format!(
-            "{label} cdp={} fetch={fetch_ms:.0}ms deliver={deliver}ms",
+            "{label} status={status} ok={ok} cdp={} fetch={fetch_ms:.0}ms deliver={deliver}ms",
             crate::trace::ms(cdp)
         ));
 

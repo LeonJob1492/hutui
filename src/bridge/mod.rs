@@ -38,6 +38,10 @@ pub enum Cmd {
     LoadFeed {
         want: usize,
     },
+    /// 推荐流被"打开回答"打断后，从上次的 cursor 接着拉
+    ResumeFeed {
+        want: usize,
+    },
     /// a = 当前这条回答的权威内容，b = 该问题下的回答列表。
     /// `req` 是打开序号：旧序号的事件到主线程后会被丢掉。
     OpenAnswer {
