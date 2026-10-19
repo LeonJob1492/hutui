@@ -19,6 +19,12 @@ pub const PAGE_TIMEOUT_MS: u64 = 2_800;
 /// 阅读流硬上限
 pub const STREAM_MAX: usize = 50;
 
+/// 界面整体最大宽度。终端按字符列计，这里按 8px/字符折算：
+/// 1024px ÷ 8 = 128 列。要改宽度只动 MAX_LAYOUT_PX。
+pub const MAX_LAYOUT_PX: u16 = 1024;
+pub const CELL_PX: u16 = 8;
+pub const MAX_LAYOUT_COLS: u16 = MAX_LAYOUT_PX / CELL_PX;
+
 pub fn profile_dir() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     PathBuf::from(home).join(".hutui").join("chrome-profile")

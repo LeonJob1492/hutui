@@ -19,15 +19,26 @@ pub struct App {
     pub view: View,
     /// 从 panic 恢复时回到哪个视图
     pub resume: View,
+
+    // ---- 列表
     pub feed: Vec<AnswerItem>,
     pub cursor: usize,
     pub list_offset: usize,
+
+    // ---- 阅读：一条一屏，↑↓ 换条
     pub stream: Vec<AnswerItem>,
+    pub index: usize,
+    /// 当前这条回答摊平后的行
     pub lines: Vec<Line<'static>>,
-    pub block_starts: Vec<usize>,
+    /// 当前这条回答内的滚动位置
     pub scroll: usize,
+    /// 每条回答各自的滚动位置，切回来时不丢
+    pub scrolls: Vec<usize>,
+
+    // ---- 布局
     pub built_width: u16,
     pub body_h: u16,
+
     pub status: String,
     pub quit: bool,
     last_esc: Option<Instant>,
@@ -43,9 +54,10 @@ impl App {
             cursor: 0,
             list_offset: 0,
             stream: Vec::new(),
+            index: 0,
             lines: Vec::new(),
-            block_starts: Vec::new(),
             scroll: 0,
+            scrolls: Vec::new(),
             built_width: 0,
             body_h: 0,
             status: "连接中…".into(),
@@ -122,17 +134,18 @@ impl App {
         }
     }
 
+    /// 阅读视图：↑↓ 换回答；单条答案比一屏长时用 PgUp/PgDn 在条内滚。
     fn on_key_reading(&mut self, k: KeyEvent) {
         let page = (self.body_h.saturating_sub(1) as usize).max(1);
         match k.code {
-            KeyCode::Up | KeyCode::Char('k') => self.scroll = self.scroll.saturating_sub(1),
-            KeyCode::Down | KeyCode::Char('j') => self.scroll_by(1),
+            KeyCode::Up | KeyCode::Char('k') => self.step_answer(-1),
+            KeyCode::Down | KeyCode::Char('j') => self.step_answer(1),
+            KeyCode::Char('n') => self.step_answer(1),
+            KeyCode::Char('p') => self.step_answer(-1),
             KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
             KeyCode::PageDown => self.scroll_by(page),
             KeyCode::Home => self.scroll = 0,
-            KeyCode::End => self.scroll = self.lines.len().saturating_sub(self.body_h as usize),
-            KeyCode::Char('n') => self.jump_block(1),
-            KeyCode::Char('p') => self.jump_block(-1),
+            KeyCode::End => self.scroll = self.max_scroll(),
             KeyCode::Left | KeyCode::Backspace => self.back_to_list(),
             KeyCode::Char('q') => self.quit = true,
             _ => {}
@@ -156,7 +169,9 @@ impl App {
             return;
         };
         self.stream = vec![item.clone()];
+        self.index = 0;
         self.scroll = 0;
+        self.scrolls = vec![0];
         self.view = View::Reading;
         self.resume = View::Reading;
         self.rebuild();
@@ -177,31 +192,45 @@ impl App {
         self.status.clear();
     }
 
-    fn scroll_by(&mut self, n: usize) {
-        let max = self.lines.len().saturating_sub(self.body_h as usize);
-        self.scroll = (self.scroll + n).min(max);
-    }
-
-    fn jump_block(&mut self, dir: i32) {
-        if self.block_starts.is_empty() {
+    /// 切换到上/下一条回答，顺带还原那条自己的滚动位置
+    fn step_answer(&mut self, delta: isize) {
+        if self.stream.is_empty() {
             return;
         }
-        let after = self
-            .block_starts
-            .iter()
-            .position(|&s| s > self.scroll)
-            .unwrap_or(self.block_starts.len());
-        let idx = if dir >= 0 {
-            after.min(self.block_starts.len() - 1)
+        if self.scrolls.len() != self.stream.len() {
+            self.scrolls.resize(self.stream.len(), 0);
+        }
+        self.scrolls[self.index] = self.scroll;
+
+        let next = if delta < 0 {
+            self.index.saturating_sub(delta.unsigned_abs())
         } else {
-            after.saturating_sub(2)
+            (self.index + delta as usize).min(self.stream.len() - 1)
         };
-        self.scroll = self.block_starts[idx];
+        if next == self.index {
+            self.status = if delta < 0 {
+                "已是第一条".into()
+            } else {
+                "已是最后一条".into()
+            };
+            return;
+        }
+        self.index = next;
+        self.scroll = *self.scrolls.get(next).unwrap_or(&0);
+        self.rebuild();
+    }
+
+    fn max_scroll(&self) -> usize {
+        self.lines.len().saturating_sub(self.body_h as usize)
+    }
+
+    fn scroll_by(&mut self, n: usize) {
+        self.scroll = (self.scroll + n).min(self.max_scroll());
     }
 
     // ------------------------------------------------------------- 布局
 
-    /// 宽度变化时重建阅读流（换行结果依赖宽度）
+    /// 宽度变化时重建当前回答的行（换行结果依赖宽度）
     pub fn ensure_layout(&mut self, width: u16) {
         if self.built_width != width {
             self.built_width = width;
@@ -213,26 +242,32 @@ impl App {
 
     pub fn rebuild(&mut self) {
         let w = self.built_width.max(24);
-        let (lines, starts) = ui::reading::build(&self.stream, w);
-        self.lines = lines;
-        self.block_starts = starts;
-        let max = self.lines.len().saturating_sub(self.body_h as usize);
+        self.lines = self
+            .stream
+            .get(self.index)
+            .map(|item| ui::reading::build(item, self.index, self.stream.len(), w))
+            .unwrap_or_default();
+        let max = self.max_scroll();
         if self.scroll > max {
             self.scroll = max;
         }
     }
 
     /// 当前读到第几条（给 header 用）
-    pub fn current_block(&self) -> Option<(usize, usize)> {
-        if self.block_starts.is_empty() {
+    pub fn current_answer(&self) -> Option<(usize, usize)> {
+        if self.stream.is_empty() {
             return None;
         }
-        let idx = self
-            .block_starts
-            .iter()
-            .rposition(|&s| s <= self.scroll)
-            .unwrap_or(0);
-        Some((idx, self.block_starts.len()))
+        Some((self.index, self.stream.len()))
+    }
+
+    /// 条内滚动进度：(已滚, 总可滚)，给 footer 用
+    pub fn scroll_progress(&self) -> Option<(usize, usize)> {
+        let max = self.max_scroll();
+        if max == 0 {
+            return None;
+        }
+        Some((self.scroll.min(max), max))
     }
 
     // ------------------------------------------------------------- 桥接事件
@@ -257,11 +292,11 @@ impl App {
                         continue;
                     }
                     self.stream.push(it);
+                    self.scrolls.push(0);
                     added += 1;
                 }
-                if added > 0 {
-                    self.rebuild();
-                }
+                // 当前这条没变，不需要重建；只是总数变了
+                let _ = added;
                 self.status = if is_end {
                     format!("{} 条回答 · 已到底", self.stream.len())
                 } else {
