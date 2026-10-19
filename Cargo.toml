@@ -1,0 +1,24 @@
+[package]
+name = "hutui"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "终端里的 Codex 皮阅读器"
+
+[[bin]]
+name = "hutui"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+crossterm = "0.28"
+ratatui = "0.29"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tungstenite = "0.24"
+unicode-width = "0.1"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true

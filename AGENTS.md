@@ -1,0 +1,90 @@
+# hutui 项目规范
+
+## 项目定位
+
+在终端里浏览知乎网页版的 TUI 工具，界面参照 Codex CLI，运行于本机 Ghostty（1.3.1）。
+
+**定位优先级：摸鱼伪装优先** —— 窗口看起来要像个正在跑 codex 的终端，其次才是阅读体验。这条优先级决定后面所有命名与交互取舍。
+
+## 命名口径（2026-10-15 定案）
+
+| 层 | 取值 | 说明 |
+|---|---|---|
+| 仓库名 | `hutui` | 对齐本地短单词风格（`passport`、`token-lens`） |
+| 二进制名 | `hutui` + `ks` 别名 | 两者本机 PATH 均未占用 |
+| 包名（备用） | `hutui` | npm / crates.io / PyPI 三注册表均可用 |
+| 配置命名空间 | `hutui:` | 本地键前缀，与 `ngax:` / `v2cx:` 血统一致 |
+| Ghostty 标签标题 | `handler.rs — gateway` | 沿用 nga-codex 的 `<源码文件名> — <项目名>` 模式 |
+| 侧栏品牌名 | `Codex` | 同上 |
+| panic 快捷键 | 连按两下 `Esc` + `Ctrl+Shift+H` | 沿用已形成肌肉记忆的方案 |
+
+`hutui` = 知乎的「乎」+ TUI。选它的核心理由：**GitHub 零命中、无商标联想、进程名不泄露「知乎」**（`ps` 里藏不住，这是当初排除 `zhihu-reader` 的原因）。
+
+已排除的名字：`zhihu-tui`（GitHub 两个同名仓库）、`zhihu-cli`（npm + crates 已占用，且知乎官方 Skill 的二进制就叫这个）、`saltui`、`zhiliao`、`zhi-cli`、`moyu`（均被占用）。
+
+## 已核验的硬约束（不要重新假设）
+
+1. **知乎游客走不通**：`curl` 返回 403（`code:40362`）；浏览器里导航首页会 302 到 `/signin?next=%2F`。必须登录态。
+2. **不能自己造 `/api/*` 请求**：正文来自带 `x-zse-96` 签名的接口，签名由知乎自己的 JS 算，手造必挂。
+3. **边界（Leon 划定）**：登录态下给自己换皮属客户端行为，可以做；**伪造签名或伪造客户端身份直连接口不做**。
+4. **可落地架构**：独立 Chrome 实例 + CDP 被动捕获（读知乎**自己发出**的响应体）+ TUI 只做渲染层。
+   数据链路细节全部实测过，见 `docs/design.md` 第 2 节——那里的结论比在这里复述可靠，改动前先读它。
+
+## 伪装优先带来的两条新约束（2026-10-15 新增，前序文档未覆盖）
+
+1. **panic 模式必须整体重绘**：终端里没有 DOM 可叠。油猴脚本可以 `display:none` 藏原生再叠一层假 UI，但 Ghostty 的「视口」就是 TUI 画出的字符网格，所以 panic 必须让 TUI **全屏重绘**成「代码编辑器 + 正在跑 `cargo test` 的终端」的字符画面。切换**不能有异步半帧**，否则会闪出知乎正文，伪装当场失败。
+2. **自动伪装已砍**（2026-10-15 决定）：原 1004 焦点上报 / `NSWorkspace` 前端 App 检测两条路都不做，只保留手动触发。理由：省掉一个不确定源，而「屏幕自己闪一下」本身就是暴露点。手动 panic = `Esc` 连按两下，或 `Ctrl-H`。
+
+## 窗口标题：已验证可直接控制（利好）
+
+`/Users/leon/Library/Application Support/com.mitchellh.ghostty/config.ghostty` 已设
+`shell-integration-features = cursor,no-sudo,no-title,no-ssh-env,no-ssh-terminfo,path`，
+Ghostty 自带 shell 集成**不写标题**；`/Users/leon/.zshrc` 的 `_leon_window_title_precmd` 写 `${PWD:t}`，
+但 **TUI 前台运行时 precmd 不触发**。
+
+→ 结论：**TUI 用 OSC 2 写伪装标题不会被覆盖**，退出后自动恢复成目录名。链路细节见 memory 的「终端 / Ghostty 窗口标题」章节。
+
+## 可复用的存量资产（别重复造）
+
+| 资产 | 路径 | 用途 |
+|---|---|---|
+| 知乎官方 Skill v0.3.0 | `leon-claw/workspace/skills/zhihu/` | 搜索 / 热榜 / 直答 / 我的内容 |
+| 热榜抓取脚本 | `leon-claw/workspace/zhihu-scraper-final.mjs` | 108 行，配 cookie |
+| 登录 cookie | `leon-claw/workspace/zhihu-cookies.json`、`zhihu-cookie.txt` | 已有登录态 |
+| 热榜历史快照 | `leon-claw/workspace/memory/zhihu-hot/*.json` | 每天 4 次，含 rank/title/url/缩略图/摘要 |
+| 定时器 | `leon-claw/systemd/openclaw-zhihu-hot-*.{service,timer}` | 已在跑 |
+
+**取数能力已被官方 Skill 覆盖，本项目的差异化价值在「读网页版正文 + Codex 皮」。**
+
+## 已定案（2026-10-15）
+
+| 决策 | 结论 |
+|---|---|
+| 技术选型 | **Rust + ratatui**。理由：panic 必须零半帧，ratatui 双缓冲 + 单次 flush 最可控；单二进制、毫秒启动、终端控制粒度最细 |
+| 架构 | **浏览器桥 + 终端渲染**：独立 Chrome 实例（`~/.hutui/chrome-profile`）⇄ CDP ⇄ Rust TUI |
+| 浏览器窗口 | 有窗口 + `open -n -g` 后台启动；**允许可见，但绝不抢焦点** |
+| 正文渲染 | 渲染成「codex 助手的 markdown 输出」形态，**不做**行号编辑器皮肤 |
+| 阅读模型 | **连续流**：该问题下的回答首尾相接，↑↓ 滚过边界即下一条；`n`/`p` 条级跳转 |
+| 主闭环 | 推荐流列表（↑↓ 选择）→ `→` 进阅读流 → `←` 回列表 |
+| 自动伪装 | **不做**，只保留手动 panic |
+| 取数边界 | 只读；不做赞/收藏/评论等写操作 |
+
+## 代码结构
+
+```
+src/main.rs          入口、事件循环
+src/app.rs           状态机（List / Reading / Panic）+ 按键
+src/term.rs          终端生命周期、OSC 2 伪装标题、panic hook
+src/text.rs          CJK 感知换行 / 截断 / 数字压缩
+src/ui/              list · reading · panic · theme
+src/zhihu/           领域模型 + 三个接口的解析器
+src/bridge/          chrome 生命周期 · cdp 客户端 · 工作线程
+```
+
+`probe/` 是五轮 CDP 探针的现场脚本与原始报告，**已进 `.gitignore`**（报告里有登录昵称与回答内容）。
+
+## 文档索引
+
+- **项目设计文档（实现的唯一事实源）**：`/Users/leon/Code/hutui/docs/design.md`
+- 本项目定名与本会话结论：`/Users/leon/Code/leon-claw/workspace/memory/2026-10-15-hutui-zhihu-terminal-codex-skin.md`
+- 前序可行性评估（油猴脚本拆解 + 知乎移植分析）：`/Users/leon/Code/leon-claw/workspace/memory/2026-09-23-nga-codex-zhihu-disguise-feasibility.md`
