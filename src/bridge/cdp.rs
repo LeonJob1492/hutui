@@ -99,9 +99,11 @@ impl Cdp {
         if let Some(s) = session {
             msg["sessionId"] = json!(s);
         }
-        self.ws
-            .send(Message::Text(msg.to_string()))
-            .context("发送 CDP 消息失败")?;
+        if let Err(e) = self.ws.send(Message::Text(msg.to_string())) {
+            // 对端已关闭（AlreadyClosed 之类）也要算死，不能只靠后面的 pump 兜
+            self.dead = true;
+            return Err(e).context("发送 CDP 消息失败");
+        }
         Ok(id)
     }
 
@@ -171,6 +173,8 @@ impl Cdp {
                 return Ok(v.get("result").cloned().unwrap_or(Value::Null));
             }
             if Instant::now() > deadline {
+                // Chrome 卡死时别让后面每条命令都再等 30s
+                self.dead = true;
                 bail!("CDP {method} 超时");
             }
             self.pump(Duration::from_millis(30))?;

@@ -1,5 +1,6 @@
 use anyhow::{anyhow, bail, Result};
 use serde_json::json;
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
@@ -15,21 +16,36 @@ const ANSWER_INCLUDE: &str =
     "content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
 const LIST_INCLUDE: &str = "data[*].content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
 
-/// 长任务在翻页间隙看一眼有没有新命令，有就提前收工，把新命令交回主循环。
-fn take_pending(rx: &Receiver<Cmd>) -> Option<Cmd> {
-    let mut last = None;
-    while let Ok(cmd) = rx.try_recv() {
-        last = Some(cmd);
+/// 只有「换内容」的命令才值得打断正在跑的长任务。
+fn supersedes(cmd: &Cmd) -> bool {
+    matches!(cmd, Cmd::OpenAnswer { .. } | Cmd::LoadFeed { .. })
+}
+
+/// 收进 backlog。重复打开只保留最后一次，其余命令一条都不能丢。
+fn push_cmd(backlog: &mut VecDeque<Cmd>, cmd: Cmd) {
+    if matches!(cmd, Cmd::OpenAnswer { .. }) {
+        backlog.retain(|c| !matches!(c, Cmd::OpenAnswer { .. }));
     }
-    last
+    backlog.push_back(cmd);
+}
+
+/// 出错时用来只清对应那条在途标记
+fn action_key(cmd: &Cmd) -> Option<String> {
+    match cmd {
+        Cmd::Vote { aid, .. } => Some(format!("{aid}:v")),
+        Cmd::Favorite { aid, .. } => Some(format!("{aid}:f")),
+        Cmd::Comments { .. } => Some("comments".into()),
+        _ => None,
+    }
 }
 
 pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
     let mut ctx = Ctx::default();
-    let mut pending: Option<Cmd> = None;
+    let mut backlog: VecDeque<Cmd> = VecDeque::new();
 
     loop {
-        let cmd = match pending.take() {
+        // 先清积压，再去等新命令
+        let cmd = match backlog.pop_front() {
             Some(cmd) => cmd,
             None => match rx.recv() {
                 Ok(cmd) => cmd,
@@ -37,23 +53,25 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
             },
         };
 
+        let action = action_key(&cmd);
         let result = match cmd {
-            Cmd::LoadFeed { want } => ctx.load_feed(&tx, &rx, want),
-            Cmd::OpenAnswer { qid, aid, req } => ctx.open_answer(&tx, &rx, &qid, &aid, req),
+            Cmd::LoadFeed { want } => ctx.load_feed(&tx, &rx, &mut backlog, want),
+            Cmd::OpenAnswer { qid, aid, req } => {
+                ctx.open_answer(&tx, &rx, &mut backlog, &qid, &aid, req)
+            }
             Cmd::Vote { aid, kind, vote } => ctx.vote(&tx, &aid, &kind, vote),
             Cmd::Favorite { aid, kind, on } => ctx.favorite(&tx, &aid, &kind, on),
             Cmd::Comments { aid, kind, offset } => ctx.comments(&tx, &aid, &kind, offset),
         };
 
-        match result {
-            Ok(Some(next)) => pending = Some(next),
-            Ok(None) => {}
-            Err(e) => {
-                let _ = tx.send(Event::Error(format!("{e:#}")));
-                // 连接或目标已经死掉：清空会话，下一条命令会自动重连
-                if ctx.is_dead() {
-                    ctx.reset();
-                }
+        if let Err(e) = result {
+            let _ = tx.send(Event::Error {
+                msg: format!("{e:#}"),
+                action,
+            });
+            // 连接或目标已经死掉：清空会话，下一条命令会自动重连
+            if ctx.is_dead() {
+                ctx.reset();
             }
         }
     }
@@ -101,6 +119,47 @@ impl Ctx {
     fn reset(&mut self) {
         self.cdp = None;
         self.session = None;
+    }
+
+    /// 把队列里的命令收进 backlog；顺手把「不打断加载」的命令就地执行掉，
+    /// 这样按 z 不用等三页翻完。返回 true 表示该收工让路了。
+    fn service(
+        &mut self,
+        tx: &Sender<Event>,
+        rx: &Receiver<Cmd>,
+        backlog: &mut VecDeque<Cmd>,
+    ) -> bool {
+        while let Ok(cmd) = rx.try_recv() {
+            push_cmd(backlog, cmd);
+        }
+
+        let mut i = 0;
+        while i < backlog.len() {
+            if supersedes(&backlog[i]) {
+                i += 1;
+                continue;
+            }
+            let cmd = backlog.remove(i).expect("下标在范围内");
+            let action = action_key(&cmd);
+            if let Err(e) = self.run_quick(cmd, tx) {
+                let _ = tx.send(Event::Error {
+                    msg: format!("{e:#}"),
+                    action,
+                });
+            }
+        }
+
+        backlog.iter().any(supersedes)
+    }
+
+    fn run_quick(&mut self, cmd: Cmd, tx: &Sender<Event>) -> Result<()> {
+        match cmd {
+            Cmd::Vote { aid, kind, vote } => self.vote(tx, &aid, &kind, vote),
+            Cmd::Favorite { aid, kind, on } => self.favorite(tx, &aid, &kind, on),
+            Cmd::Comments { aid, kind, offset } => self.comments(tx, &aid, &kind, offset),
+            // 长任务不该走到这里
+            _ => Ok(()),
+        }
     }
 
     fn ensure(&mut self, tx: &Sender<Event>) -> Result<()> {
@@ -205,8 +264,9 @@ impl Ctx {
         &mut self,
         tx: &Sender<Event>,
         rx: &Receiver<Cmd>,
+        backlog: &mut VecDeque<Cmd>,
         want: usize,
-    ) -> Result<Option<Cmd>> {
+    ) -> Result<()> {
         self.ensure(tx)?;
         let _ = tx.send(Event::Status("fetching feed…".into()));
 
@@ -224,8 +284,8 @@ impl Ctx {
             if acc.len() >= want {
                 break;
             }
-            if let Some(next) = take_pending(rx) {
-                return Ok(Some(next));
+            if self.service(tx, rx, backlog) {
+                return Ok(());
             }
             match parse::next_page_url(&v) {
                 Some(next) => url = next,
@@ -234,17 +294,18 @@ impl Ctx {
         }
 
         let _ = tx.send(Event::Status(format!("{} items", acc.len())));
-        Ok(None)
+        Ok(())
     }
 
     fn open_answer(
         &mut self,
         tx: &Sender<Event>,
         rx: &Receiver<Cmd>,
+        backlog: &mut VecDeque<Cmd>,
         qid: &str,
         aid: &str,
         req: u64,
-    ) -> Result<Option<Cmd>> {
+    ) -> Result<()> {
         self.ensure(tx)?;
 
         let _ = tx.send(Event::Status("fetching answer…".into()));
@@ -262,7 +323,7 @@ impl Ctx {
 
         if qid.is_empty() {
             let _ = tx.send(Event::Status("no parent thread".into()));
-            return Ok(None);
+            return Ok(());
         }
 
         let _ = tx.send(Event::Status("fetching siblings…".into()));
@@ -270,10 +331,10 @@ impl Ctx {
         let mut offset = 0usize;
         let limit = config::ANSWERS_PAGE;
 
-        let total = loop {
-            // 用户在翻页间隙又打开了别的东西：立刻让路
-            if let Some(next) = take_pending(rx) {
-                return Ok(Some(next));
+        loop {
+            // 队列里如果有「换内容」的命令就收工让路；其余命令就地执行掉
+            if self.service(tx, rx, backlog) {
+                return Ok(());
             }
 
             let url = format!(
@@ -283,7 +344,7 @@ impl Ctx {
             let v = self.fetch(&url)?;
             let (items, total, is_end) = parse::parse_answers_page(&v);
             if items.is_empty() {
-                break total;
+                break;
             }
             offset += items.len();
             append_unique(&mut acc, items);
@@ -293,21 +354,15 @@ impl Ctx {
                 req,
             });
             if is_end || acc.len() >= config::STREAM_MAX {
-                break total;
+                break;
             }
-        };
+        }
 
-        let _ = tx.send(Event::Status(format!("{total} answers")));
-        Ok(None)
+        let _ = tx.send(Event::Status(format!("{} answers", acc.len())));
+        Ok(())
     }
 
-    fn comments(
-        &mut self,
-        tx: &Sender<Event>,
-        aid: &str,
-        kind: &str,
-        offset: usize,
-    ) -> Result<Option<Cmd>> {
+    fn comments(&mut self, tx: &Sender<Event>, aid: &str, kind: &str, offset: usize) -> Result<()> {
         self.ensure(tx)?;
         let url = format!(
             "{HOME}/api/v4/{0}/{aid}/comments?limit={1}&offset={offset}&order=normal",
@@ -323,18 +378,12 @@ impl Ctx {
             total,
             next_offset: next,
         });
-        Ok(None)
+        Ok(())
     }
 
     // ---------------------------------------------------------------- 写
 
-    fn vote(
-        &mut self,
-        tx: &Sender<Event>,
-        aid: &str,
-        kind: &str,
-        vote: Vote,
-    ) -> Result<Option<Cmd>> {
+    fn vote(&mut self, tx: &Sender<Event>, aid: &str, kind: &str, vote: Vote) -> Result<()> {
         self.ensure(tx)?;
         let _ = tx.send(Event::Status("sending…".into()));
 
@@ -349,7 +398,7 @@ impl Ctx {
             vote,
             count,
         });
-        Ok(None)
+        Ok(())
     }
 
     fn default_collection(&mut self) -> Result<String> {
@@ -369,13 +418,7 @@ impl Ctx {
         Ok(id)
     }
 
-    fn favorite(
-        &mut self,
-        tx: &Sender<Event>,
-        aid: &str,
-        kind: &str,
-        on: bool,
-    ) -> Result<Option<Cmd>> {
+    fn favorite(&mut self, tx: &Sender<Event>, aid: &str, kind: &str, on: bool) -> Result<()> {
         self.ensure(tx)?;
         let _ = tx.send(Event::Status(if on {
             "saving…".into()
@@ -403,7 +446,7 @@ impl Ctx {
             aid: aid.to_string(),
             on,
         });
-        Ok(None)
+        Ok(())
     }
 }
 
@@ -415,5 +458,84 @@ fn append_unique(acc: &mut Vec<AnswerItem>, items: Vec<AnswerItem>) {
         if !acc.iter().any(|x| x.id == it.id) {
             acc.push(it);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn open(aid: &str, req: u64) -> Cmd {
+        Cmd::OpenAnswer {
+            qid: "q".into(),
+            aid: aid.into(),
+            req,
+        }
+    }
+
+    fn vote(aid: &str) -> Cmd {
+        Cmd::Vote {
+            aid: aid.into(),
+            kind: "answer".into(),
+            vote: Vote::Up,
+        }
+    }
+
+    #[test]
+    fn only_content_switches_supersede() {
+        assert!(supersedes(&open("a", 1)));
+        assert!(supersedes(&Cmd::LoadFeed { want: 10 }));
+        assert!(!supersedes(&vote("a")));
+        assert!(!supersedes(&Cmd::Comments {
+            aid: "a".into(),
+            kind: "answer".into(),
+            offset: 0
+        }));
+    }
+
+    /// 关键：Vote / Comments 一条都不能丢，只合并重复的 OpenAnswer
+    #[test]
+    fn backlog_never_drops_actions() {
+        let mut b: VecDeque<Cmd> = VecDeque::new();
+        push_cmd(&mut b, vote("a"));
+        push_cmd(&mut b, open("x", 1));
+        push_cmd(
+            &mut b,
+            Cmd::Comments {
+                aid: "a".into(),
+                kind: "answer".into(),
+                offset: 0,
+            },
+        );
+        push_cmd(&mut b, open("y", 2));
+
+        assert_eq!(b.len(), 3, "两次 OpenAnswer 合并成一条，其余保留");
+        assert!(matches!(b[0], Cmd::Vote { .. }));
+        assert!(matches!(b[1], Cmd::Comments { .. }));
+        assert!(matches!(&b[2], Cmd::OpenAnswer { aid, req, .. } if aid == "y" && *req == 2));
+    }
+
+    #[test]
+    fn action_keys_map_to_pending_marks() {
+        assert_eq!(action_key(&vote("a")).as_deref(), Some("a:v"));
+        assert_eq!(
+            action_key(&Cmd::Favorite {
+                aid: "a".into(),
+                kind: "answer".into(),
+                on: true
+            })
+            .as_deref(),
+            Some("a:f")
+        );
+        assert_eq!(
+            action_key(&Cmd::Comments {
+                aid: "a".into(),
+                kind: "answer".into(),
+                offset: 0
+            })
+            .as_deref(),
+            Some("comments")
+        );
+        assert_eq!(action_key(&open("a", 1)), None);
     }
 }

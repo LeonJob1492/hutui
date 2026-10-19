@@ -117,3 +117,4 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     f.render_widget(Paragraph::new(Text::from(visible)), area);
 }
 
+

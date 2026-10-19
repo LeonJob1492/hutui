@@ -490,7 +490,6 @@ impl App {
                 self.cursor = anchor
                     .and_then(|id| self.feed.iter().position(|x| x.id == id))
                     .unwrap_or(0);
-                self.list_offset = 0;
                 self.status = format!("{} items", self.feed.len());
             }
 
@@ -580,11 +579,16 @@ impl App {
                 self.status = format!("{total} comments");
             }
 
-            BridgeEvent::Error(e) => {
-                // 失败也要解除"加载中"，否则评论区会永久卡死
-                self.comments.loading = false;
-                self.pending.clear();
-                self.status = format!("× {e}");
+            BridgeEvent::Error { msg, action } => {
+                // 只清掉出错的那一条，别误伤别的请求的在途标记
+                match action.as_deref() {
+                    Some("comments") => self.comments.loading = false,
+                    Some(key) => {
+                        self.pending.remove(key);
+                    }
+                    None => {}
+                }
+                self.status = format!("× {msg}");
             }
         }
     }
@@ -595,11 +599,15 @@ mod tests {
     use super::*;
     use crate::state::ReadLog;
 
-    fn app() -> App {
+    fn app(tag: &str) -> App {
         let (tx, _rx) = std::sync::mpsc::channel();
         let mut a = App::new(tx);
-        // 别碰真实的家目录
-        a.read = ReadLog::load_from(std::path::PathBuf::from("/tmp/hutui-test-read.json"));
+        // 别碰真实的家目录；每个测试用独立文件，并行跑也不互相覆盖
+        let path = std::env::temp_dir().join(format!(
+            "hutui-test-read-{}-{tag}.json",
+            std::process::id()
+        ));
+        a.read = ReadLog::load_from(path);
         a
     }
 
@@ -614,7 +622,7 @@ mod tests {
     /// 修 bug 1：旧编号的 Answers 不能覆盖新打开的那篇
     #[test]
     fn stale_answers_are_dropped() {
-        let mut a = app();
+        let mut a = app("stale");
         a.feed = vec![item("a")];
         a.open_reading(); // req -> 1，stream = [a]
         let req_now = a.req;
@@ -637,7 +645,7 @@ mod tests {
     /// 修 bug 5：应急画面下按键不能把正文请回来
     #[test]
     fn panic_swallows_plain_keys() {
-        let mut a = app();
+        let mut a = app("panic");
         a.feed = vec![item("a")];
         a.open_reading();
         a.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -654,9 +662,12 @@ mod tests {
     /// 修 bug 2：请求失败后 comments.loading 必须解锁
     #[test]
     fn comment_error_unlocks_loading() {
-        let mut a = app();
+        let mut a = app("comments");
         a.comments.loading = true;
-        a.on_bridge(BridgeEvent::Error("boom".into()));
+        a.on_bridge(BridgeEvent::Error {
+            msg: "boom".into(),
+            action: Some("comments".into()),
+        });
         assert!(!a.comments.loading);
     }
 }

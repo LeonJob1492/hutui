@@ -66,7 +66,12 @@ pub enum Event {
         total: usize,
         next_offset: usize,
     },
-    Error(String),
+    /// `action` 是出错动作的键（"aid:v" / "aid:f" / "comments"），
+    /// 主线程据此只清掉对应那一条在途标记，不误伤别的请求。
+    Error {
+        msg: String,
+        action: Option<String>,
+    },
 }
 
 /// 起工作线程，返回命令口与事件口
