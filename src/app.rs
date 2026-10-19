@@ -1,10 +1,9 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
 use std::collections::HashMap;
-use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
-use crate::bridge::{Cmd, Event as BridgeEvent};
+use crate::bridge::{Cmd, Event as BridgeEvent, Tx};
 use crate::config;
 use crate::state::ReadLog;
 use crate::ui;
@@ -61,9 +60,11 @@ pub struct App {
     pub stream: Vec<AnswerItem>,
     pub index: usize,
     pub total: usize,
+    /// 吸顶信息条（分隔行 / 标题 / 作者），不参与滚动
+    pub header: Vec<Line<'static>>,
+    /// 可滚动正文
     pub lines: Vec<Line<'static>>,
     pub scroll: usize,
-    scroll_by_id: HashMap<String, usize>,
 
     /// 每条内容上我的表态（赞/收藏）
     pub meta: HashMap<String, AnswerMeta>,
@@ -82,11 +83,11 @@ pub struct App {
     /// 进行中的写操作，key 形如 "aid:v" / "aid:f"，防止连按重复提交
     pending: std::collections::HashSet<String>,
     last_esc: Option<Instant>,
-    tx: Sender<Cmd>,
+    tx: Tx,
 }
 
 impl App {
-    pub fn new(tx: Sender<Cmd>) -> Self {
+    pub fn new(tx: Tx) -> Self {
         Self {
             view: View::List,
             resume: View::List,
@@ -99,9 +100,9 @@ impl App {
             stream: Vec::new(),
             index: 0,
             total: 0,
+            header: Vec::new(),
             lines: Vec::new(),
             scroll: 0,
-            scroll_by_id: HashMap::new(),
             meta: HashMap::new(),
             comments: CommentsState::default(),
             built_width: 0,
@@ -184,18 +185,20 @@ impl App {
     }
 
     fn on_key_reading(&mut self, k: KeyEvent) {
-        let page = (self.body_h.saturating_sub(1) as usize).max(1);
         match k.code {
-            KeyCode::Up | KeyCode::Char('k') => self.step_answer(-1),
-            KeyCode::Down | KeyCode::Char('j') => self.step_answer(1),
+            // ↑↓ 先在本条内翻屏，翻到边界才换条
+            KeyCode::Up | KeyCode::Char('k') => self.page_up_or_prev(),
+            KeyCode::Down | KeyCode::Char('j') => self.page_down_or_next(),
+            // n/p 只换条不翻屏
             KeyCode::Char('n') => self.step_answer(1),
             KeyCode::Char('p') => self.step_answer(-1),
             KeyCode::Char('z') => self.toggle_vote(Vote::Up),
             KeyCode::Char('v') => self.toggle_vote(Vote::Down),
             KeyCode::Char('c') => self.toggle_fav(),
             KeyCode::Char('x') => self.open_comments(),
-            KeyCode::PageUp => self.scroll = self.scroll.saturating_sub(page),
-            KeyCode::PageDown => self.scroll_by(page),
+            // PgUp/PgDn 只翻屏，不换条
+            KeyCode::PageUp => self.page_only(false),
+            KeyCode::PageDown => self.page_only(true),
             KeyCode::Home => self.scroll = 0,
             KeyCode::End => self.scroll = self.max_scroll(),
             KeyCode::Left | KeyCode::Backspace => self.back_to_list(),
@@ -296,9 +299,6 @@ impl App {
         if self.stream.is_empty() {
             return;
         }
-        let cur_id = self.stream[self.index].id.clone();
-        self.scroll_by_id.insert(cur_id, self.scroll);
-
         let next = if delta < 0 {
             self.index.saturating_sub(delta.unsigned_abs())
         } else {
@@ -309,7 +309,8 @@ impl App {
             return;
         }
         self.index = next;
-        self.scroll = *self.scroll_by_id.get(&self.stream[next].id).unwrap_or(&0);
+        // 往下切落到新一条的顶部；往上切落到它的底部，接着往上翻很自然
+        self.scroll = if delta < 0 { usize::MAX } else { 0 };
         self.rebuild();
     }
 
@@ -393,8 +394,35 @@ impl App {
         self.lines.len().saturating_sub(self.body_h as usize)
     }
 
-    fn scroll_by(&mut self, n: usize) {
-        self.scroll = (self.scroll + n).min(self.max_scroll());
+    fn page(&self) -> usize {
+        (self.body_h as usize).max(1)
+    }
+
+    /// ↑：还在本条中间就先往回翻一屏，翻到顶才换上一条
+    fn page_up_or_prev(&mut self) {
+        if self.scroll > 0 {
+            self.scroll = self.scroll.saturating_sub(self.page());
+        } else {
+            self.step_answer(-1);
+        }
+    }
+
+    /// ↓：还有下文就先翻一屏，翻到底才换下一条
+    fn page_down_or_next(&mut self) {
+        if self.scroll < self.max_scroll() {
+            self.scroll = (self.scroll + self.page()).min(self.max_scroll());
+        } else {
+            self.step_answer(1);
+        }
+    }
+
+    /// PgDn/PgUp：只在本条内翻屏，不换条
+    fn page_only(&mut self, down: bool) {
+        if down {
+            self.scroll = (self.scroll + self.page()).min(self.max_scroll());
+        } else {
+            self.scroll = self.scroll.saturating_sub(self.page());
+        }
     }
 
     // ------------------------------------------------------------- 布局
@@ -420,11 +448,13 @@ impl App {
         let w = self.built_width.max(24);
         let shown = self.total.max(self.stream.len());
         let meta = self.current().and_then(|it| self.meta.get(&it.id));
-        self.lines = self
+        let (header, body) = self
             .stream
             .get(self.index)
             .map(|item| ui::reading::build(item, self.index, shown, meta, w))
             .unwrap_or_default();
+        self.header = header;
+        self.lines = body;
         let max = self.max_scroll();
         if self.scroll > max {
             self.scroll = max;
@@ -456,12 +486,15 @@ impl App {
         Some((self.index, self.total.max(self.stream.len())))
     }
 
-    pub fn scroll_progress(&self) -> Option<(usize, usize)> {
-        let max = self.max_scroll();
-        if max == 0 {
+    /// 本条内的页进度（1 起算）；只有一页时返回 None
+    pub fn page_progress(&self) -> Option<(usize, usize)> {
+        let page = self.page();
+        let total = self.lines.len();
+        if total <= page {
             return None;
         }
-        Some((self.scroll.min(max), max))
+        let pages = (total + page - 1) / page;
+        Some((self.scroll / page + 1, pages))
     }
 
     pub fn comment_progress(&self) -> Option<(usize, usize)> {
@@ -527,7 +560,8 @@ impl App {
                         ordered.insert(0, cur);
                     }
                 }
-                let scroll = self.scroll_by_id.get(&cur_id).copied().unwrap_or(0);
+                // 重排时保持当前读到哪儿，不跳回顶部
+                let scroll = self.scroll;
                 self.stream = ordered;
                 self.index = self
                     .stream
@@ -600,8 +634,7 @@ mod tests {
     use crate::state::ReadLog;
 
     fn app(tag: &str) -> App {
-        let (tx, _rx) = std::sync::mpsc::channel();
-        let mut a = App::new(tx);
+        let mut a = App::new(Tx::for_test());
         // 别碰真实的家目录；每个测试用独立文件，并行跑也不互相覆盖
         let path = std::env::temp_dir().join(format!(
             "hutui-test-read-{}-{tag}.json",
@@ -657,6 +690,65 @@ mod tests {
             assert_eq!(a.view, View::Panic, "{k:?} 不该能关掉应急画面");
         }
         assert!(!a.quit);
+    }
+
+    /// C 方案：↑↓ 先在本条内翻屏，翻到边界才换条；同一条内吸顶条不变
+    #[test]
+    fn paging_stays_in_answer_until_boundary() {
+        let mut a = app("paging");
+        let mut long = item("long");
+        long.content = "很长的一段话，用来撑出好几屏。".repeat(200);
+        a.stream = vec![long, item("next")];
+        a.index = 0;
+        a.total = 2;
+        a.built_width = 60;
+        a.body_h = 8;
+        a.rebuild();
+        assert!(a.lines.len() > 8, "这条要够长才有翻页");
+
+        let before: Vec<String> = a.header.iter().map(|l| format!("{l:?}")).collect();
+        a.page_down_or_next();
+        assert_eq!(a.index, 0, "没到底之前不该换条");
+        assert!(a.scroll > 0, "应该翻了一屏");
+        let after: Vec<String> = a.header.iter().map(|l| format!("{l:?}")).collect();
+        assert_eq!(before, after, "同一条里翻屏，吸顶条一个字都不能变");
+
+        for _ in 0..200 {
+            a.page_down_or_next();
+        }
+        assert_eq!(a.index, 1, "翻到底后 ↓ 要换下一条");
+        assert_eq!(a.scroll, 0, "往下切换落到新一条顶部");
+
+        // 反向：到顶再 ↑ 换上一条，并落在它的底部
+        a.page_up_or_prev();
+        assert_eq!(a.index, 0);
+        assert_eq!(a.scroll, a.max_scroll(), "往上切换落在上一条底部");
+    }
+
+    /// PgUp/PgDn 只翻屏，不换条
+    #[test]
+    fn page_keys_never_switch_answer() {
+        let mut a = app("pageonly");
+        let mut long = item("long");
+        long.content = "很长的内容。".repeat(300);
+        a.stream = vec![long, item("next")];
+        a.index = 0;
+        a.total = 2;
+        a.built_width = 60;
+        a.body_h = 8;
+        a.rebuild();
+
+        for _ in 0..50 {
+            a.page_only(true);
+        }
+        assert_eq!(a.index, 0, "PgDn 不该换条");
+        assert_eq!(a.scroll, a.max_scroll());
+
+        for _ in 0..50 {
+            a.page_only(false);
+        }
+        assert_eq!(a.index, 0);
+        assert_eq!(a.scroll, 0);
     }
 
     /// 修 bug 2：请求失败后 comments.loading 必须解锁

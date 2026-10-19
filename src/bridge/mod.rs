@@ -4,6 +4,33 @@ pub mod worker;
 
 use crate::zhihu::{AnswerItem, Comment, Vote};
 use std::sync::mpsc::{channel, Receiver, Sender};
+use std::time::Instant;
+
+/// 带发送时间戳的命令，用来量「排队等了多久」
+#[derive(Debug, Clone)]
+pub struct Queued {
+    pub cmd: Cmd,
+    pub at: Instant,
+}
+
+/// 命令口。发出去时自动打时间戳，调用方写法不变。
+#[derive(Clone)]
+pub struct Tx(Sender<Queued>);
+
+impl Tx {
+    pub fn send(&self, cmd: Cmd) {
+        let _ = self.0.send(Queued {
+            cmd,
+            at: Instant::now(),
+        });
+    }
+
+    #[cfg(test)]
+    pub fn for_test() -> Self {
+        let (tx, _rx) = channel();
+        Tx(tx)
+    }
+}
 
 /// 主线程 → 工作线程
 #[derive(Debug, Clone)]
@@ -75,12 +102,12 @@ pub enum Event {
 }
 
 /// 起工作线程，返回命令口与事件口
-pub fn spawn() -> (Sender<Cmd>, Receiver<Event>) {
-    let (cmd_tx, cmd_rx) = channel::<Cmd>();
+pub fn spawn() -> (Tx, Receiver<Event>) {
+    let (cmd_tx, cmd_rx) = channel::<Queued>();
     let (ev_tx, ev_rx) = channel::<Event>();
     std::thread::Builder::new()
         .name("hutui-bridge".into())
         .spawn(move || worker::run(cmd_rx, ev_tx))
         .expect("无法启动桥接线程");
-    (cmd_tx, ev_rx)
+    (Tx(cmd_tx), ev_rx)
 }

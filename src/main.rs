@@ -4,6 +4,7 @@ mod config;
 mod state;
 mod term;
 mod text;
+mod trace;
 mod ui;
 mod zhihu;
 

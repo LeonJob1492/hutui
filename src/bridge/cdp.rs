@@ -181,13 +181,16 @@ impl Cdp {
         }
     }
 
-    /// 在页面上下文里跑一段 JS，返回 (ok, status, text)
-    fn run_js(&mut self, session: &str, expr: &str) -> Result<(bool, i64, String)> {
+    /// 在页面上下文里跑一段 JS，返回 (ok, status, text)。
+    /// 顺带把「CDP 往返」和「页面内 fetch」两段耗时写进 trace.log。
+    fn run_js(&mut self, session: &str, label: &str, expr: &str) -> Result<(bool, i64, String)> {
+        let t0 = Instant::now();
         let res = self.call(
             "Runtime.evaluate",
             json!({ "expression": expr, "returnByValue": true, "awaitPromise": true }),
             Some(session),
         )?;
+        let cdp = t0.elapsed();
 
         let val = &res["result"]["value"];
         if val.is_null() {
@@ -197,6 +200,12 @@ impl Cdp {
                 .unwrap_or_else(|| "无返回值".into());
             bail!("页面求值失败: {detail}");
         }
+        let fetch_ms = val["ms"].as_f64().unwrap_or(-1.0);
+        crate::trace::log(&format!(
+            "{label} cdp={} fetch={fetch_ms:.0}ms",
+            crate::trace::ms(cdp)
+        ));
+
         Ok((
             val["ok"].as_bool().unwrap_or(false),
             val["status"].as_i64().unwrap_or(0),
@@ -211,14 +220,16 @@ impl Cdp {
         let quoted = serde_json::to_string(url)?;
         let expr = format!(
             "(async () => {{ \
+               const t0 = performance.now(); \
                try {{ \
                  const r = await fetch({quoted}, {{ credentials: 'include' }}); \
-                 return {{ ok: r.ok, status: r.status, text: await r.text() }}; \
-               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e) }}; }} \
+                 return {{ ok: r.ok, status: r.status, text: await r.text(), ms: performance.now() - t0 }}; \
+               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1 }}; }} \
              }})()"
         );
 
-        let (ok, status, text) = self.run_js(session, &expr)?;
+        let label = format!("GET {}", brief(url));
+        let (ok, status, text) = self.run_js(session, &label, &expr)?;
         if !ok || status != 200 {
             let head: String = text.chars().take(160).collect();
             bail!("{} → HTTP {status}: {head}", brief(url));
@@ -244,6 +255,7 @@ impl Cdp {
         let expr = format!(
             "(async () => {{ \
                const xsrf = decodeURIComponent(((document.cookie.match(/_xsrf=([^;]+)/) || [])[1] || '')); \
+               const t0 = performance.now(); \
                try {{ \
                  const h = {{ 'x-xsrftoken': xsrf }}; \
                  if ({body_lit} !== null) h['content-type'] = 'application/json'; \
@@ -253,12 +265,13 @@ impl Cdp {
                    headers: h, \
                    body: {body_lit} \
                  }}); \
-                 return {{ ok: r.ok, status: r.status, text: await r.text() }}; \
-               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e) }}; }} \
+                 return {{ ok: r.ok, status: r.status, text: await r.text(), ms: performance.now() - t0 }}; \
+               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1 }}; }} \
              }})()"
         );
 
-        let (ok, status, text) = self.run_js(session, &expr)?;
+        let label = format!("{method} {}", brief(url));
+        let (ok, status, text) = self.run_js(session, &label, &expr)?;
         if !ok || !(200..300).contains(&status) {
             let head: String = text.chars().take(160).collect();
             bail!("{method} {} → HTTP {status}: {head}", brief(url));

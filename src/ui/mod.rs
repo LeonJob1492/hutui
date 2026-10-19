@@ -35,11 +35,24 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     .split(area);
 
     header(f, app, rows[0]);
-    app.body_h = rows[1].height;
     match app.view {
-        View::List => list::draw(f, app, rows[1]),
-        View::Reading => reading::draw(f, app, rows[1]),
-        View::Comments => comments::draw(f, app, rows[1]),
+        View::List => {
+            app.body_h = rows[1].height;
+            list::draw(f, app, rows[1]);
+        }
+        View::Reading => {
+            // 吸顶信息条占顶部固定几行，正文区独立滚动
+            let head_h = (app.header.len() as u16).min(rows[1].height.saturating_sub(1));
+            let parts =
+                Layout::vertical([Constraint::Length(head_h), Constraint::Min(1)]).split(rows[1]);
+            app.body_h = parts[1].height;
+            reading::draw_header(f, app, parts[0]);
+            reading::draw(f, app, parts[1]);
+        }
+        View::Comments => {
+            app.body_h = rows[1].height;
+            comments::draw(f, app, rows[1]);
+        }
         View::Panic => {}
     }
     footer(f, app, rows[2]);
@@ -108,8 +121,8 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
     let aside = match app.view {
         // 长回答里得知道自己在文中哪儿
         View::Reading => app
-            .scroll_progress()
-            .map(|(cur, max)| format!("{cur}/{max} "))
+            .page_progress()
+            .map(|(cur, pages)| format!("{cur}/{pages} "))
             .unwrap_or_default(),
         View::Comments => app
             .comment_progress()

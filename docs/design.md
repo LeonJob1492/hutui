@@ -159,8 +159,10 @@ window.fetch 是原生函数（/[native code]/），知乎没有 patch 它
        └─ b: fetch /questions/{qid}/answers   → 按接口顺序重排整个列表，
                                                  并把当前这条定位到它自己的位置
 
-阅读  一条一屏。↑↓ / j k / n p 切换该问题下的上/下一条
-      PgUp/PgDn · Home/End  在当前这条内部滚动（每条按 id 记住位置）
+阅读  一条一屏 + 吸顶信息条（位置/标题/作者固定，只有正文滚动）
+      ↑↓ / j k   先在本条内翻一屏，翻到底/顶才换下/上一条
+      PgUp/PgDn  只翻屏，不换条        n / p  只换条，不翻屏
+      Home/End   本条开头/结尾
       z 赞 / 取消          v 反对 / 取消        c 收藏 / 取消        x 评论区
       ← / Backspace 返回列表
 
@@ -190,7 +192,7 @@ header  ▌ Codex  ~/hutui  main*  ·  rustc 1.98              3/42
         回形针 · 1.2w 赞 ✓ · 已收藏 · 2026-02-25 14:13
         （空行）
         正文段落（2 空格缩进）
-footer  {状态：英文短句，如 fetching feed… / 42 items}     ↑12 ↓8
+footer  {状态：英文短句，如 fetching feed… / 42 items}     ↑12 ↓8（列表）
 ```
 
 - **已读置灰**：打开过就记一条 `~/.hutui/read.json`（上限 800 条，超出丢最早），

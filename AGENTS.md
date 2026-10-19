@@ -68,14 +68,15 @@ Ghostty 自带 shell 集成**不写标题**；`/Users/leon/.zshrc` 的 `_leon_wi
 | 架构 | **浏览器桥 + 终端渲染**：独立 Chrome 实例（`~/.hutui/chrome-profile`）⇄ CDP ⇄ Rust TUI |
 | 浏览器窗口 | 有窗口 + `open -n -g` 后台启动；**允许可见，但绝不抢焦点** |
 | 正文渲染 | 渲染成「codex 助手的 markdown 输出」形态，**不做**行号编辑器皮肤 |
-| 阅读模型 | **一条一屏**：只显示当前这条回答，↑↓ 直接切换该问题下的上/下一条；条内滚动用 PgUp/PgDn，每条各自记住滚动位置 |
+| 阅读模型 | **一条一屏 + 吸顶信息条**：顶部固定位置/标题/作者，正文独立滚动；↑↓ 先翻屏、到边界才换条，`n`/`p` 只换条，PgUp/PgDn 只翻屏 |
 | 界面宽度 | 整体限制 **1024px**（按 8px/字符折算 128 列），超出部分居中留白；常量在 `src/config.rs` 的 `MAX_LAYOUT_PX` |
 | 主闭环 | 推荐流列表（↑↓ 选择）→ `→` 进阅读流 → `←` 回列表 |
 | 自动伪装 | **不做**，只保留手动 panic |
 | 取数方式 | **直接 `fetch` 接口**：页面同源上下文里一次 `fetch`，跟随 `paging.next` / 按 `offset` 翻页；不模拟页面操作 |
 | 单篇 / 列表 | a = `/api/v4/answers/{aid}` 展示当前条，b = `/api/v4/questions/{qid}/answers` 准备 ↑↓ 切换（`paging.totals` 给总数） |
+| 计时日志 | 每请求写一行到 `~/.hutui/trace.log`，含 queued / cdp / fetch 三段耗时 |
 | 写操作 | 赞 / 收藏 / 评论均已实测（只需 `x-xsrftoken`，不需签名），接口见 `docs/design.md` 2.5；评论只读 |
-| 键位 | 列表 ↑↓ → ←；阅读 ↑↓ 换回答、PgUp/PgDn 条内滚动、`z` 赞、`v` 反对、`x` 评论区、`c` 收藏、← 返回；评论区 `↵` 加载更多；`Esc`×2 或 `Ctrl-H` panic |
+| 键位 | 列表 ↑↓ → ←；阅读 ↑↓ 翻屏（到边界换条）、`n`/`p` 只换条、PgUp/PgDn 只翻屏、`z` 赞、`v` 反对、`x` 评论区、`c` 收藏、← 返回；评论区 `↵` 加载更多；`Esc`×2 或 `Ctrl-H` panic |
 
 ## 代码结构
 

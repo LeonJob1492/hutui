@@ -5,8 +5,9 @@ use std::sync::mpsc::{Receiver, Sender};
 use std::time::{Duration, Instant};
 
 use super::cdp::Cdp;
-use super::{chrome, Cmd, Event};
+use super::{chrome, Cmd, Event, Queued};
 use crate::config;
+use crate::trace;
 use crate::zhihu::parse;
 use crate::zhihu::{AnswerItem, Vote};
 
@@ -16,17 +17,27 @@ const ANSWER_INCLUDE: &str =
     "content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
 const LIST_INCLUDE: &str = "data[*].content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
 
+fn op_name(cmd: &Cmd) -> &'static str {
+    match cmd {
+        Cmd::LoadFeed { .. } => "LoadFeed",
+        Cmd::OpenAnswer { .. } => "OpenAnswer",
+        Cmd::Vote { .. } => "Vote",
+        Cmd::Favorite { .. } => "Favorite",
+        Cmd::Comments { .. } => "Comments",
+    }
+}
+
 /// 只有「换内容」的命令才值得打断正在跑的长任务。
 fn supersedes(cmd: &Cmd) -> bool {
     matches!(cmd, Cmd::OpenAnswer { .. } | Cmd::LoadFeed { .. })
 }
 
 /// 收进 backlog。重复打开只保留最后一次，其余命令一条都不能丢。
-fn push_cmd(backlog: &mut VecDeque<Cmd>, cmd: Cmd) {
-    if matches!(cmd, Cmd::OpenAnswer { .. }) {
-        backlog.retain(|c| !matches!(c, Cmd::OpenAnswer { .. }));
+fn push_cmd(backlog: &mut VecDeque<Queued>, job: Queued) {
+    if matches!(job.cmd, Cmd::OpenAnswer { .. }) {
+        backlog.retain(|q| !matches!(q.cmd, Cmd::OpenAnswer { .. }));
     }
-    backlog.push_back(cmd);
+    backlog.push_back(job);
 }
 
 /// 出错时用来只清对应那条在途标记
@@ -39,22 +50,28 @@ fn action_key(cmd: &Cmd) -> Option<String> {
     }
 }
 
-pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
+pub fn run(rx: Receiver<Queued>, tx: Sender<Event>) {
     let mut ctx = Ctx::default();
-    let mut backlog: VecDeque<Cmd> = VecDeque::new();
+    let mut backlog: VecDeque<Queued> = VecDeque::new();
 
     loop {
         // 先清积压，再去等新命令
-        let cmd = match backlog.pop_front() {
-            Some(cmd) => cmd,
+        let job = match backlog.pop_front() {
+            Some(job) => job,
             None => match rx.recv() {
-                Ok(cmd) => cmd,
+                Ok(job) => job,
                 Err(_) => break,
             },
         };
 
-        let action = action_key(&cmd);
-        let result = match cmd {
+        trace::log(&format!(
+            "cmd {} queued={}",
+            op_name(&job.cmd),
+            trace::ms(job.at.elapsed())
+        ));
+
+        let action = action_key(&job.cmd);
+        let result = match job.cmd {
             Cmd::LoadFeed { want } => ctx.load_feed(&tx, &rx, &mut backlog, want),
             Cmd::OpenAnswer { qid, aid, req } => {
                 ctx.open_answer(&tx, &rx, &mut backlog, &qid, &aid, req)
@@ -126,22 +143,27 @@ impl Ctx {
     fn service(
         &mut self,
         tx: &Sender<Event>,
-        rx: &Receiver<Cmd>,
-        backlog: &mut VecDeque<Cmd>,
+        rx: &Receiver<Queued>,
+        backlog: &mut VecDeque<Queued>,
     ) -> bool {
-        while let Ok(cmd) = rx.try_recv() {
-            push_cmd(backlog, cmd);
+        while let Ok(job) = rx.try_recv() {
+            push_cmd(backlog, job);
         }
 
         let mut i = 0;
         while i < backlog.len() {
-            if supersedes(&backlog[i]) {
+            if supersedes(&backlog[i].cmd) {
                 i += 1;
                 continue;
             }
-            let cmd = backlog.remove(i).expect("下标在范围内");
-            let action = action_key(&cmd);
-            if let Err(e) = self.run_quick(cmd, tx) {
+            let job = backlog.remove(i).expect("下标在范围内");
+            trace::log(&format!(
+                "cmd {} queued={} inline",
+                op_name(&job.cmd),
+                trace::ms(job.at.elapsed())
+            ));
+            let action = action_key(&job.cmd);
+            if let Err(e) = self.run_quick(job.cmd, tx) {
                 let _ = tx.send(Event::Error {
                     msg: format!("{e:#}"),
                     action,
@@ -149,7 +171,7 @@ impl Ctx {
             }
         }
 
-        backlog.iter().any(supersedes)
+        backlog.iter().any(|q| supersedes(&q.cmd))
     }
 
     fn run_quick(&mut self, cmd: Cmd, tx: &Sender<Event>) -> Result<()> {
@@ -171,6 +193,7 @@ impl Ctx {
         chrome::ensure(config::CDP_PORT)?;
 
         let _ = tx.send(Event::Status("attaching debugger…".into()));
+        let t0 = Instant::now();
         let mut cdp = Cdp::connect(config::CDP_PORT)?;
 
         // 已经有知乎标签页就直接复用，避免每次启动都堆一个
@@ -188,6 +211,7 @@ impl Ctx {
                 })
             });
 
+        let reused = existing.is_some();
         let target_id = match existing {
             Some(id) => id,
             None => {
@@ -213,6 +237,10 @@ impl Ctx {
 
         self.cdp = Some(cdp);
         self.session = Some(session);
+        trace::log(&format!(
+            "attach reused={reused} total={}",
+            trace::ms(t0.elapsed())
+        ));
         self.wait_origin(tx)?;
         Ok(())
     }
@@ -263,8 +291,8 @@ impl Ctx {
     fn load_feed(
         &mut self,
         tx: &Sender<Event>,
-        rx: &Receiver<Cmd>,
-        backlog: &mut VecDeque<Cmd>,
+        rx: &Receiver<Queued>,
+        backlog: &mut VecDeque<Queued>,
         want: usize,
     ) -> Result<()> {
         self.ensure(tx)?;
@@ -300,8 +328,8 @@ impl Ctx {
     fn open_answer(
         &mut self,
         tx: &Sender<Event>,
-        rx: &Receiver<Cmd>,
-        backlog: &mut VecDeque<Cmd>,
+        rx: &Receiver<Queued>,
+        backlog: &mut VecDeque<Queued>,
         qid: &str,
         aid: &str,
         req: u64,
@@ -465,6 +493,13 @@ fn append_unique(acc: &mut Vec<AnswerItem>, items: Vec<AnswerItem>) {
 mod tests {
     use super::*;
 
+    fn queued(cmd: Cmd) -> Queued {
+        Queued {
+            cmd,
+            at: Instant::now(),
+        }
+    }
+
     fn open(aid: &str, req: u64) -> Cmd {
         Cmd::OpenAnswer {
             qid: "q".into(),
@@ -496,23 +531,25 @@ mod tests {
     /// 关键：Vote / Comments 一条都不能丢，只合并重复的 OpenAnswer
     #[test]
     fn backlog_never_drops_actions() {
-        let mut b: VecDeque<Cmd> = VecDeque::new();
-        push_cmd(&mut b, vote("a"));
-        push_cmd(&mut b, open("x", 1));
+        let mut b: VecDeque<Queued> = VecDeque::new();
+        push_cmd(&mut b, queued(vote("a")));
+        push_cmd(&mut b, queued(open("x", 1)));
         push_cmd(
             &mut b,
-            Cmd::Comments {
+            queued(Cmd::Comments {
                 aid: "a".into(),
                 kind: "answer".into(),
                 offset: 0,
-            },
+            }),
         );
-        push_cmd(&mut b, open("y", 2));
+        push_cmd(&mut b, queued(open("y", 2)));
 
         assert_eq!(b.len(), 3, "两次 OpenAnswer 合并成一条，其余保留");
-        assert!(matches!(b[0], Cmd::Vote { .. }));
-        assert!(matches!(b[1], Cmd::Comments { .. }));
-        assert!(matches!(&b[2], Cmd::OpenAnswer { aid, req, .. } if aid == "y" && *req == 2));
+        assert!(matches!(b[0].cmd, Cmd::Vote { .. }));
+        assert!(matches!(b[1].cmd, Cmd::Comments { .. }));
+        assert!(
+            matches!(&b[2].cmd, Cmd::OpenAnswer { aid, req, .. } if aid == "y" && *req == 2)
+        );
     }
 
     #[test]
