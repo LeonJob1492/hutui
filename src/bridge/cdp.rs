@@ -192,13 +192,22 @@ impl Cdp {
         )?;
         let cdp = t0.elapsed();
 
+        // promise 被 reject 时 CDP 会带 exceptionDetails，而 result.value 可能是 {}
+        // —— 不先看这里，就会把"脚本炸了"误读成"HTTP 0 空响应"。
+        if let Some(details) = res.get("exceptionDetails") {
+            let desc = details
+                .get("exception")
+                .and_then(|e| e.get("description"))
+                .and_then(Value::as_str)
+                .or_else(|| details.get("text").and_then(Value::as_str))
+                .unwrap_or("页面脚本抛异常");
+            let brief: String = desc.lines().next().unwrap_or(desc).chars().take(120).collect();
+            bail!("页面脚本出错: {brief}");
+        }
+
         let val = &res["result"]["value"];
         if val.is_null() {
-            let detail = res
-                .get("exceptionDetails")
-                .map(|d| d.to_string())
-                .unwrap_or_else(|| "无返回值".into());
-            bail!("页面求值失败: {detail}");
+            bail!("页面求值失败: 没有返回值");
         }
         // 用同一台机器的墙钟拆三段：派发（CDP→渲染进程）、fetch、回传（渲染进程→我们）
         let fetch_ms = val["ms"].as_f64().unwrap_or(-1.0);
@@ -221,24 +230,15 @@ impl Cdp {
     ///
     /// 用的是页面自己的 cookie —— 不做任何签名伪造，这些接口本身也不校验签名。
     pub fn fetch_json(&mut self, session: &str, url: &str) -> Result<Value> {
-        let quoted = serde_json::to_string(url)?;
-        let expr = format!(
-            "(async () => {{ \
-               const tin = Date.now(), t0 = performance.now(); \
-               try {{ \
-                 const r = await fetch({quoted}, {{ credentials: 'include' }}); \
-                 const text = await r.text(); \
-                 return {{ ok: r.ok, status: r.status, text, ms: performance.now() - t0, \
-                           tin, tout: Date.now() }}; \
-               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1, \
-                                        tin, tout: Date.now() }}; }} \
-             }})()"
-        );
+        let expr = fetch_expr(url)?;
 
         let label = format!("GET {}", brief(url));
         let (ok, status, text) = self.run_js(session, &label, &expr)?;
+        let head: String = text.chars().take(160).collect();
+        if status == 0 {
+            bail!("{} → 请求没发出去: {head}", brief(url));
+        }
         if !ok || status != 200 {
-            let head: String = text.chars().take(160).collect();
             bail!("{} → HTTP {status}: {head}", brief(url));
         }
         serde_json::from_str(&text).with_context(|| format!("{} 返回的不是 JSON", brief(url)))
@@ -252,43 +252,92 @@ impl Cdp {
         url: &str,
         body: Option<&str>,
     ) -> Result<Value> {
-        let url_lit = serde_json::to_string(url)?;
-        let method_lit = serde_json::to_string(method)?;
-        let body_lit = match body {
-            Some(b) => serde_json::to_string(b)?,
-            None => "null".to_string(),
-        };
-
-        let expr = format!(
-            "(async () => {{ \
-               const xsrf = decodeURIComponent(((document.cookie.match(/_xsrf=([^;]+)/) || [])[1] || '')); \
-               const t0 = performance.now(); \
-               try {{ \
-                 const h = {{ 'x-xsrftoken': xsrf }}; \
-                 if ({body_lit} !== null) h['content-type'] = 'application/json'; \
-                 const r = await fetch({url_lit}, {{ \
-                   method: {method_lit}, \
-                   credentials: 'include', \
-                   headers: h, \
-                   body: {body_lit} \
-                 }}); \
-                 const text = await r.text(); \
-                 return {{ ok: r.ok, status: r.status, text, ms: performance.now() - t0, \
-                           tin: t_in, tout: Date.now() }}; \
-               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1, \
-                                        tin: t_in, tout: Date.now() }}; }} \
-             }})()"
-        );
+        let expr = write_expr(method, url, body)?;
 
         let label = format!("{method} {}", brief(url));
         let (ok, status, text) = self.run_js(session, &label, &expr)?;
+        let head: String = text.chars().take(160).collect();
+        if status == 0 {
+            bail!("{method} {} → 请求没发出去: {head}", brief(url));
+        }
         if !ok || !(200..300).contains(&status) {
-            let head: String = text.chars().take(160).collect();
             bail!("{method} {} → HTTP {status}: {head}", brief(url));
         }
         if text.trim().is_empty() {
             return Ok(Value::Null);
         }
         Ok(serde_json::from_str(&text).unwrap_or(Value::Null))
+    }
+}
+
+/// 生成「读接口」的页面脚本。抽成纯函数是为了能被测试盯住——
+/// 模板里引用未声明变量会变成 `ReferenceError`，而 V8 会把 reject 值序列化成 `{}`，
+/// 上层就会误读成 `HTTP 0` 空响应，排查起来很费劲。
+fn fetch_expr(url: &str) -> Result<String> {
+    let quoted = serde_json::to_string(url)?;
+    Ok(format!(
+        "(async () => {{ \
+           const tin = Date.now(), t0 = performance.now(); \
+           try {{ \
+             const r = await fetch({quoted}, {{ credentials: 'include' }}); \
+             const text = await r.text(); \
+             return {{ ok: r.ok, status: r.status, text, ms: performance.now() - t0, \
+                       tin, tout: Date.now() }}; \
+           }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1, \
+                                    tin, tout: Date.now() }}; }} \
+         }})()"
+    ))
+}
+
+/// 生成「写接口」的页面脚本（带 x-xsrftoken）
+fn write_expr(method: &str, url: &str, body: Option<&str>) -> Result<String> {
+    let url_lit = serde_json::to_string(url)?;
+    let method_lit = serde_json::to_string(method)?;
+    let body_lit = match body {
+        Some(b) => serde_json::to_string(b)?,
+        None => "null".to_string(),
+    };
+    Ok(format!(
+        "(async () => {{ \
+           const xsrf = decodeURIComponent(((document.cookie.match(/_xsrf=([^;]+)/) || [])[1] || '')); \
+           const tin = Date.now(), t0 = performance.now(); \
+           try {{ \
+             const h = {{ 'x-xsrftoken': xsrf }}; \
+             if ({body_lit} !== null) h['content-type'] = 'application/json'; \
+             const r = await fetch({url_lit}, {{ \
+               method: {method_lit}, \
+               credentials: 'include', \
+               headers: h, \
+               body: {body_lit} \
+             }}); \
+             const text = await r.text(); \
+             return {{ ok: r.ok, status: r.status, text, ms: performance.now() - t0, \
+                       tin, tout: Date.now() }}; \
+           }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1, \
+                                    tin, tout: Date.now() }}; }} \
+         }})()"
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 模板里每个用到的计时变量都必须先声明；写错过一次 `t_in`，
+    /// 表现为 `HTTP 0:`，很难从客户端看出来。
+    #[test]
+    fn expressions_declare_every_timing_var() {
+        for expr in [
+            fetch_expr("https://www.zhihu.com/api/v4/me").unwrap(),
+            write_expr("POST", "https://www.zhihu.com/api/v4/answers/1/voters", Some("{}"))
+                .unwrap(),
+            write_expr("DELETE", "https://www.zhihu.com/api/v4/collections/contents/answer/1", None)
+                .unwrap(),
+        ] {
+            assert!(expr.contains("const tin"), "tin 必须声明: {expr}");
+            assert!(expr.contains("tin,") || expr.contains("tin "), "tin 要被用上");
+            assert!(!expr.contains("t_in"), "不能出现未声明的 t_in: {expr}");
+            assert!(expr.contains("tout: Date.now()"), "tout 要就地取");
+        }
     }
 }
