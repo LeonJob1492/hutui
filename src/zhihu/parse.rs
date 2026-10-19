@@ -95,6 +95,41 @@ pub fn next_page_url(v: &Value) -> Option<String> {
         .map(str::to_string)
 }
 
+// ---------------------------------------------------------------- 付费内容
+
+/// 盐选/付费内容在网页接口里只给开头预览，末尾挂一段"去 App 看全文"。
+/// 匹配前先去掉所有空白，因为换行和缩进会把原句切碎。
+const PAYWALL_MARKERS: &[&str] = &[
+    "使用App查看完整内容",
+    "该付费内容的完整版",
+    "仅支持在App中查看",
+    "打开App查看完整内容",
+    "在App内查看完整内容",
+    "前往App查看完整内容",
+];
+
+fn squeeze(s: &str) -> String {
+    s.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+pub fn is_paywalled_text(text: &str) -> bool {
+    if text.is_empty() {
+        return false;
+    }
+    let flat = squeeze(text);
+    if PAYWALL_MARKERS.iter().any(|m| flat.contains(m)) {
+        return true;
+    }
+    // 正文几乎只剩一句"去 App 看"时也算付费内容；
+    // 长文里顺嘴提到「App 内查看」不算，避免误杀。
+    flat.chars().count() <= 200 && flat.contains("App内查看")
+}
+
+/// 正文或摘要命中付费提示就整条丢掉——这种内容在 TUI 里没有阅读价值。
+pub fn is_paywalled(item: &AnswerItem) -> bool {
+    is_paywalled_text(&item.content) || is_paywalled_text(&item.excerpt)
+}
+
 // ---------------------------------------------------------------- HTML → 文本
 
 pub fn html_to_text(html: &str) -> String {
@@ -236,6 +271,25 @@ mod tests {
         assert_eq!(items[0].content, "x");
         assert_eq!(total, 15);
         assert!(!is_end);
+    }
+
+    #[test]
+    fn detects_paywalled_preview() {
+        // 用户给的真实文案（带空格和图标，归一化后仍要命中）
+        assert!(is_paywalled_text("使用 App 查看完整内容"));
+        assert!(is_paywalled_text(
+            "目前，该付费内容的完整版仅支持在 App 中查看"
+        ));
+        assert!(is_paywalled_text("🔗App 内查看"));
+
+        // 正文里提到"付费"但在讨论别的事，绝不能误杀
+        assert!(!is_paywalled_text(
+            "我们聊了聊内容付费这件事，以及为什么很多人不愿意为知识买单。"
+        ));
+        // 长文里顺嘴提到「App 内查看」也不能误杀
+        let long = "这是一段正常的长回答，".repeat(60) + "你也可以在 App 内查看。";
+        assert!(!is_paywalled_text(&long));
+        assert!(!is_paywalled_text(""));
     }
 
     #[test]

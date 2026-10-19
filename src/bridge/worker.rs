@@ -370,7 +370,12 @@ impl Ctx {
         match self.fetch(&url) {
             Ok(v) => {
                 if let Some(item) = parse::parse_answer_entity(&v) {
-                    let _ = tx.send(Event::Answer { item, req });
+                    if parse::is_paywalled(&item) {
+                        let _ = tx.send(Event::Status("paid content, skipped".into()));
+                        trace::log("single answer paywalled, skipped");
+                    } else {
+                        let _ = tx.send(Event::Answer { item, req });
+                    }
                 }
             }
             Err(e) => {
@@ -512,13 +517,22 @@ impl Ctx {
 }
 
 fn append_unique(acc: &mut Vec<AnswerItem>, items: Vec<AnswerItem>) {
+    let mut skipped = 0usize;
     for it in items {
         if it.content.is_empty() {
+            continue;
+        }
+        // 付费/盐选内容只有开头预览 + "去 App 看全文"，不往列表里塞
+        if parse::is_paywalled(&it) {
+            skipped += 1;
             continue;
         }
         if !acc.iter().any(|x| x.id == it.id) {
             acc.push(it);
         }
+    }
+    if skipped > 0 {
+        trace::log(&format!("filtered {skipped} paywalled"));
     }
 }
 
