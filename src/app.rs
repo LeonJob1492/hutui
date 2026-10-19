@@ -80,8 +80,8 @@ pub struct App {
     pub dirty: bool,
     /// 打开序号：旧序号的后台事件直接丢弃
     req: u64,
-    /// 进行中的写操作，key 形如 "aid:v" / "aid:f"，防止连按重复提交
-    pending: std::collections::HashSet<String>,
+    /// 进行中的写操作：键 "aid:v" / "aid:f" → 提交前的状态快照（失败时回滚用）
+    pending: HashMap<String, AnswerMeta>,
     last_esc: Option<Instant>,
     tx: Tx,
 }
@@ -111,7 +111,7 @@ impl App {
             quit: false,
             dirty: true,
             req: 0,
-            pending: std::collections::HashSet::new(),
+            pending: HashMap::new(),
             last_esc: None,
             tx,
         }
@@ -314,22 +314,44 @@ impl App {
         self.rebuild();
     }
 
-    /// z = 赞，v = 反对；再按同一个键就取消
+    /// z = 赞，v = 反对；再按同一个键就取消。
+    /// 先在本地翻过去（乐观），失败再回滚——服务端有时要好几秒，等它会让人以为没响应。
     fn toggle_vote(&mut self, target: Vote) {
-        let Some((aid, kind, my_vote)) = self
+        let Some((aid, kind, my_vote, voteup)) = self
             .current()
-            .map(|i| (i.id.clone(), i.kind.clone(), i.my_vote))
+            .map(|i| (i.id.clone(), i.kind.clone(), i.my_vote, i.voteup))
         else {
             return;
         };
         let key = format!("{aid}:v");
-        if self.pending.contains(&key) {
+        if self.pending.contains_key(&key) {
             self.status = "sending…".into();
             return;
         }
-        let cur = self.meta.get(&aid).map(|m| m.vote).unwrap_or(my_vote);
-        let next = if cur == target { Vote::None } else { target };
-        self.pending.insert(key);
+
+        let before = self.meta.get(&aid).cloned().unwrap_or(AnswerMeta {
+            vote: my_vote,
+            voteup,
+            faved: false,
+        });
+        let next = if before.vote == target { Vote::None } else { target };
+        let delta = match (before.vote, next) {
+            (Vote::Up, Vote::None) | (Vote::Up, Vote::Down) => -1,
+            (Vote::None, Vote::Up) | (Vote::Down, Vote::Up) => 1,
+            _ => 0,
+        };
+
+        self.meta.insert(
+            aid.clone(),
+            AnswerMeta {
+                vote: next,
+                voteup: (before.voteup + delta).max(0),
+                faved: before.faved,
+            },
+        );
+        self.pending.insert(key, before);
+        self.rebuild();
+
         let _ = self.tx.send(Cmd::Vote {
             aid,
             kind,
@@ -337,18 +359,33 @@ impl App {
         });
     }
 
-    /// c：收藏（已收藏则取消）
+    /// c：收藏（已收藏则取消），同样乐观更新
     fn toggle_fav(&mut self) {
-        let Some((aid, kind)) = self.current().map(|i| (i.id.clone(), i.kind.clone())) else {
+        let Some((aid, kind, voteup, my_vote)) = self
+            .current()
+            .map(|i| (i.id.clone(), i.kind.clone(), i.voteup, i.my_vote))
+        else {
             return;
         };
         let key = format!("{aid}:f");
-        if self.pending.contains(&key) {
+        if self.pending.contains_key(&key) {
             self.status = "sending…".into();
             return;
         }
-        let on = !self.meta.get(&aid).map(|m| m.faved).unwrap_or(false);
-        self.pending.insert(key);
+
+        let before = self.meta.get(&aid).cloned().unwrap_or(AnswerMeta {
+            vote: my_vote,
+            voteup,
+            faved: false,
+        });
+        let on = !before.faved;
+        let mut after = before.clone();
+        after.faved = on;
+
+        self.meta.insert(aid.clone(), after);
+        self.pending.insert(key, before);
+        self.rebuild();
+
         let _ = self.tx.send(Cmd::Favorite { aid, kind, on });
     }
 
@@ -578,6 +615,7 @@ impl App {
                 m.vote = vote;
                 m.voteup = count;
                 self.pending.remove(&format!("{aid}:v"));
+                self.dirty = true;
                 self.status = match vote {
                     Vote::Up => format!("voted · {count}"),
                     Vote::Down => format!("downvoted · {count}"),
@@ -589,6 +627,7 @@ impl App {
             BridgeEvent::Faved { aid, on } => {
                 self.pending.remove(&format!("{aid}:f"));
                 self.meta.entry(aid).or_default().faved = on;
+                self.dirty = true;
                 self.status = if on { "saved".into() } else { "unsaved".into() };
                 self.rebuild();
             }
@@ -618,7 +657,13 @@ impl App {
                 match action.as_deref() {
                     Some("comments") => self.comments.loading = false,
                     Some(key) => {
-                        self.pending.remove(key);
+                        // 乐观更新失败：回滚到提交前的样子
+                        if let Some(before) = self.pending.remove(key) {
+                            if let Some(aid) = key.split(':').next() {
+                                self.meta.insert(aid.to_string(), before);
+                                self.rebuild();
+                            }
+                        }
                     }
                     None => {}
                 }
@@ -749,6 +794,30 @@ mod tests {
         }
         assert_eq!(a.index, 0);
         assert_eq!(a.scroll, 0);
+    }
+
+    /// 点赞/收藏是乐观更新：按键当下就变，失败再回滚
+    #[test]
+    fn vote_is_optimistic_and_rolls_back() {
+        let mut a = app("optimistic");
+        a.feed = vec![item("a")];
+        a.open_reading();
+        a.built_width = 40;
+        a.body_h = 10;
+        a.rebuild();
+
+        let before = a.meta.get("a").cloned().unwrap_or_default();
+        a.toggle_vote(Vote::Up);
+        let after = a.meta.get("a").cloned().unwrap_or_default();
+        assert_eq!(after.vote, Vote::Up, "按下就要变，不能等服务端");
+        assert_eq!(after.voteup, before.voteup + 1, "计数也要立刻 +1");
+
+        a.on_bridge(BridgeEvent::Error {
+            msg: "boom".into(),
+            action: Some("a:v".into()),
+        });
+        assert_eq!(a.meta.get("a").map(|m| m.vote), Some(Vote::None), "失败要回滚");
+        assert_eq!(a.meta.get("a").map(|m| m.voteup), Some(before.voteup));
     }
 
     /// 修 bug 2：请求失败后 comments.loading 必须解锁

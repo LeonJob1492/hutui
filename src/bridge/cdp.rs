@@ -200,9 +200,13 @@ impl Cdp {
                 .unwrap_or_else(|| "无返回值".into());
             bail!("页面求值失败: {detail}");
         }
+        // 用同一台机器的墙钟拆三段：派发（CDP→渲染进程）、fetch、回传（渲染进程→我们）
         let fetch_ms = val["ms"].as_f64().unwrap_or(-1.0);
+        let t_out = val["tout"].as_i64().unwrap_or(0);
+        let t_recv = crate::trace::epoch_ms();
+        let deliver = if t_out > 0 { t_recv - t_out } else { -1 };
         crate::trace::log(&format!(
-            "{label} cdp={} fetch={fetch_ms:.0}ms",
+            "{label} cdp={} fetch={fetch_ms:.0}ms deliver={deliver}ms",
             crate::trace::ms(cdp)
         ));
 
@@ -220,11 +224,14 @@ impl Cdp {
         let quoted = serde_json::to_string(url)?;
         let expr = format!(
             "(async () => {{ \
-               const t0 = performance.now(); \
+               const tin = Date.now(), t0 = performance.now(); \
                try {{ \
                  const r = await fetch({quoted}, {{ credentials: 'include' }}); \
-                 return {{ ok: r.ok, status: r.status, text: await r.text(), ms: performance.now() - t0 }}; \
-               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1 }}; }} \
+                 const text = await r.text(); \
+                 return {{ ok: r.ok, status: r.status, text, ms: performance.now() - t0, \
+                           tin, tout: Date.now() }}; \
+               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1, \
+                                        tin, tout: Date.now() }}; }} \
              }})()"
         );
 
@@ -265,8 +272,11 @@ impl Cdp {
                    headers: h, \
                    body: {body_lit} \
                  }}); \
-                 return {{ ok: r.ok, status: r.status, text: await r.text(), ms: performance.now() - t0 }}; \
-               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1 }}; }} \
+                 const text = await r.text(); \
+                 return {{ ok: r.ok, status: r.status, text, ms: performance.now() - t0, \
+                           tin: t_in, tout: Date.now() }}; \
+               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e), ms: -1, \
+                                        tin: t_in, tout: Date.now() }}; }} \
              }})()"
         );
 

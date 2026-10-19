@@ -52,7 +52,15 @@ fn path() -> Option<PathBuf> {
     Some(PathBuf::from(home).join(".hutui").join("trace.log"))
 }
 
-/// 把耗时格式化成毫秒，方便直接拼进日志
+/// 当前墙钟毫秒（和页面里的 Date.now() 同一基准，可直接相减）
+pub fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// 把耗时格式化毫秒，方便直接拼进日志
 pub fn ms(d: std::time::Duration) -> String {
     format!("{:.0}ms", d.as_secs_f64() * 1000.0)
 }

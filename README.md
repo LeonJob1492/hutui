@@ -165,11 +165,16 @@ src/bridge/          Chrome 生命周期、CDP 客户端、采集线程
 
 ```
 19:02:11.123 cmd Vote queued=3ms
-19:02:11.936 POST /api/v4/answers/2095.../voters cdp=812ms fetch=760ms
+19:02:11.936 POST /api/v4/answers/2095.../voters cdp=812ms fetch=760ms deliver=3ms
 ```
 
-`queued` 是命令在队列里等了多久，`cdp` 是 CDP 一来一回，`fetch` 是页面里那次 fetch
-自己的耗时。点赞/收藏慢的时候看这三段就知道卡在哪儿。
+- `queued` 命令在队列里等了多久
+- `cdp` 整个 `Runtime.evaluate` 一来一回
+- `fetch` 页面里那次 fetch 自己的耗时
+- `deliver` 页面算完到我们收到结果之间（和 fetch 一起看，就知道慢在服务端还是链路）
+
+赞 / 收藏是**乐观更新**：按键当下就变，服务端回包只是校正，失败才回滚——所以即便知乎那边
+要几秒，你也不会觉得"按了没反应"。
 
 ## 已知限制
 
