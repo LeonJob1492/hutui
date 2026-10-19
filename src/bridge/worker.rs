@@ -11,9 +11,9 @@ use crate::zhihu::{AnswerItem, Vote};
 
 const HOME: &str = "https://www.zhihu.com";
 const FEED_URL: &str = "https://www.zhihu.com/api/v3/feed/topstory/recommend?limit=10&desktop=true";
-const ANSWER_INCLUDE: &str = "content,excerpt,author,voteup_count,comment_count,question,relationship.voting";
+const ANSWER_INCLUDE: &str = "content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
 const LIST_INCLUDE: &str =
-    "data[*].content,excerpt,author,voteup_count,comment_count,question,relationship.voting";
+    "data[*].content,excerpt,author,voteup_count,comment_count,created_time,question,relationship.voting";
 
 pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
     let mut ctx = Ctx::default();

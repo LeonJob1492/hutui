@@ -21,54 +21,58 @@ pub fn build(
     let w = (width as usize).saturating_sub(2).max(20);
     let mut lines: Vec<Line<'static>> = Vec::new();
 
+    // ① 位置行：只放第几条，不再塞作者信息
+    let head = format!(" {}/{} ", index + 1, total);
+    let dashes = w.saturating_sub(text::width(&head) + 2).max(2);
+    lines.push(Line::from(Span::styled(
+        format!("──{}{}", head, "─".repeat(dashes)),
+        Style::default().fg(theme::FAINT),
+    )));
+
+    // ② 问题标题
+    if !item.question_title.is_empty() {
+        let t = text::truncate(&text::one_line(&item.question_title), w.saturating_sub(4));
+        lines.push(Line::from(Span::styled(
+            format!("  {t}"),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        )));
+    }
+
+    // ③ 次要信息：作者 · 赞数 · 表态 · 时间，统一走 META 色
     let author = if item.author.is_empty() {
         "匿名".to_string()
     } else {
         item.author.clone()
     };
     let count = meta.map(|m| m.voteup).filter(|c| *c > 0).unwrap_or(item.voteup);
-
-    let head = format!(
-        " {}/{}  ·  {author}  ·  {} 赞 ",
-        index + 1,
-        total,
-        text::compact_num(count)
-    );
     let (vote, faved) = meta.map(|m| (m.vote, m.faved)).unwrap_or((item.my_vote, false));
+    let when = text::datetime(item.created);
 
-    let faint = Style::default().fg(theme::FAINT);
-    let mut spans: Vec<Span<'static>> = vec![Span::styled(format!("──{head}"), faint)];
-    let mut used = text::width(&head) + 2;
-
+    let meta_style = Style::default().fg(theme::META);
+    let mut spans: Vec<Span<'static>> = vec![Span::styled(format!("  {author}"), meta_style)];
+    if count > 0 {
+        spans.push(Span::styled(
+            format!("  ·  {} 赞", text::compact_num(count)),
+            meta_style,
+        ));
+    }
     match vote {
-        Vote::Up => {
-            spans.push(Span::styled("✓ ", Style::default().fg(theme::ACCENT)));
-            used += 2;
-        }
-        Vote::Down => {
-            spans.push(Span::styled("✗ ", Style::default().fg(theme::WARN)));
-            used += 2;
-        }
+        Vote::Up => spans.push(Span::styled("  ✓", Style::default().fg(theme::ACCENT))),
+        Vote::Down => spans.push(Span::styled("  ✗", Style::default().fg(theme::WARN))),
         Vote::None => {}
     }
     if faved {
-        let fav = "· 已收藏 ";
-        used += text::width(fav);
-        spans.push(Span::styled(fav.to_string(), Style::default().fg(theme::DIM)));
+        spans.push(Span::styled("  ·  已收藏", meta_style));
     }
-    spans.push(Span::styled("─".repeat(w.saturating_sub(used).max(2)), faint));
+    if !when.is_empty() {
+        spans.push(Span::styled(format!("  ·  {when}"), meta_style));
+    }
     lines.push(Line::from(spans));
+    lines.push(Line::from(""));
 
-    if !item.question_title.is_empty() {
-        let t = text::truncate(&text::one_line(&item.question_title), w.saturating_sub(4));
-        lines.push(Line::from(Span::styled(
-            format!("  {t}"),
-            Style::default()
-                .fg(theme::DIM)
-                .add_modifier(Modifier::BOLD),
-        )));
-    }
-
+    // ④ 正文
     let body = if item.content.is_empty() {
         item.excerpt.clone()
     } else {
@@ -107,3 +111,4 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     f.render_widget(Paragraph::new(Text::from(visible)), area);
 }
+

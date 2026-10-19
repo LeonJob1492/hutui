@@ -15,6 +15,8 @@ pub struct AnswerItem {
     pub question_title: String,
     /// 我对这条的表态，来自 relationship.voting
     pub my_vote: Vote,
+    /// 发布时间（unix 秒）
+    pub created: i64,
 }
 
 impl AnswerItem {

@@ -95,6 +95,18 @@ pub fn one_line(s: &str) -> String {
     s.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// 绝对时间：unix 秒 → 「2026-03-02 14:22」（本地时区）
+pub fn datetime(ts: i64) -> String {
+    if ts <= 0 {
+        return String::new();
+    }
+    use chrono::{Local, TimeZone};
+    match Local.timestamp_opt(ts, 0).single() {
+        Some(dt) => dt.format("%Y-%m-%d %H:%M").to_string(),
+        None => String::new(),
+    }
+}
+
 /// 相对时间：1792299923 这样的 unix 秒 → 「3 小时前」
 pub fn ago(ts: i64) -> String {
     if ts <= 0 {

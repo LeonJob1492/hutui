@@ -52,6 +52,7 @@ fn entity_to_item(t: &Value) -> Option<AnswerItem> {
             -1 => Vote::Down,
             _ => Vote::None,
         },
+        created: as_i64(&t["created_time"]),
     })
 }
 
