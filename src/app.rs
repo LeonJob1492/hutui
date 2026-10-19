@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::bridge::{Cmd, Event as BridgeEvent};
 use crate::config;
+use crate::state::ReadLog;
 use crate::ui;
 use crate::zhihu::AnswerItem;
 
@@ -25,6 +26,11 @@ pub struct App {
     pub feed: Vec<AnswerItem>,
     pub cursor: usize,
     pub list_offset: usize,
+    /// 列表可视区上方 / 下方还剩多少条，给 footer 提示用
+    pub list_above: usize,
+    pub list_below: usize,
+    /// 看过的条目
+    pub read: ReadLog,
 
     // ---- 阅读：一条一屏，↑↓ 换条
     pub stream: Vec<AnswerItem>,
@@ -56,6 +62,9 @@ impl App {
             feed: Vec::new(),
             cursor: 0,
             list_offset: 0,
+            list_above: 0,
+            list_below: 0,
+            read: ReadLog::load(),
             stream: Vec::new(),
             index: 0,
             total: 0,
@@ -179,6 +188,7 @@ impl App {
         self.scroll = 0;
         self.view = View::Reading;
         self.resume = View::Reading;
+        self.read.mark(&item.id);
         self.rebuild();
 
         if item.question_id.is_empty() {

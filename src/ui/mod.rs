@@ -12,6 +12,9 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
+/// 右侧信息栏宽度（位置 / 滚动进度）
+const ASIDE: u16 = 12;
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     // 整体宽度上限 1024px（折算成列），超出部分居中留白
     let area = centered(f.area());
@@ -51,29 +54,39 @@ fn centered(area: Rect) -> Rect {
 }
 
 fn header(f: &mut Frame, app: &App, area: Rect) {
+    let cols = Layout::horizontal([Constraint::Min(10), Constraint::Length(ASIDE)]).split(area);
+
     let bold = Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD);
     let dim = Style::default().fg(theme::DIM);
     let faint = Style::default().fg(theme::FAINT);
 
-    let mut spans = vec![
+    let spans = vec![
         Span::styled(" ▌ ", Style::default().fg(theme::ACCENT)),
         Span::styled("Codex", bold),
         Span::styled("  ~/hutui", dim),
         Span::styled("  main*", faint),
         Span::styled("  rustc 1.98", faint),
     ];
+    f.render_widget(Paragraph::new(Line::from(spans)), cols[0]);
 
-    if app.view == View::Reading {
-        if let Some((idx, total)) = app.current_answer() {
-            spans.push(Span::styled(format!("   {}/{}", idx + 1, total), faint));
+    let aside = match app.view {
+        View::List if !app.feed.is_empty() => {
+            format!("{}/{} ", app.cursor + 1, app.feed.len())
         }
-    }
-
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+        View::Reading => app
+            .current_answer()
+            .map(|(i, t)| format!("{}/{} ", i + 1, t))
+            .unwrap_or_default(),
+        _ => String::new(),
+    };
+    f.render_widget(
+        Paragraph::new(Line::from(Span::styled(aside, faint))).alignment(Alignment::Right),
+        cols[1],
+    );
 }
 
 fn footer(f: &mut Frame, app: &App, area: Rect) {
-    let cols = Layout::horizontal([Constraint::Min(10), Constraint::Length(14)]).split(area);
+    let cols = Layout::horizontal([Constraint::Min(10), Constraint::Length(ASIDE)]).split(area);
 
     let status = text::truncate(&app.status, cols[0].width.saturating_sub(3) as usize);
     let style = if app.status.starts_with('×') {
@@ -89,17 +102,28 @@ fn footer(f: &mut Frame, app: &App, area: Rect) {
         cols[0],
     );
 
-    // 右上角给条内滚动进度，避免长回答里不知道自己在哪
-    let right = match (app.view, app.scroll_progress()) {
-        (View::Reading, Some((cur, max))) => format!("{cur}/{max} "),
+    let aside = match app.view {
+        // 长回答里得知道自己在文中哪儿
+        View::Reading => app
+            .scroll_progress()
+            .map(|(cur, max)| format!("{cur}/{max} "))
+            .unwrap_or_default(),
+        // 列表里得知道上下还压着多少条
+        View::List => {
+            let mut s = String::new();
+            if app.list_above > 0 {
+                s.push_str(&format!("↑{} ", app.list_above));
+            }
+            if app.list_below > 0 {
+                s.push_str(&format!("↓{} ", app.list_below));
+            }
+            s
+        }
         _ => String::new(),
     };
     f.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            right,
-            Style::default().fg(theme::FAINT),
-        )))
-        .alignment(Alignment::Right),
+        Paragraph::new(Line::from(Span::styled(aside, Style::default().fg(theme::FAINT))))
+            .alignment(Alignment::Right),
         cols[1],
     );
 }

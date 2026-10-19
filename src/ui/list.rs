@@ -7,13 +7,15 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 
-/// 每条占 2 行：标题 + 元信息
-const ROWS_PER_ITEM: usize = 2;
+/// 每条 2 行内容 + 1 行留白，行间留气口
+const ROWS_PER_ITEM: usize = 3;
 
 pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
     let width = area.width as usize;
 
     if app.feed.is_empty() {
+        app.list_above = 0;
+        app.list_below = 0;
         let lines = vec![
             Line::from(""),
             Line::from(Span::styled(
@@ -36,21 +38,33 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         app.list_offset = app.feed.len().saturating_sub(visible);
     }
 
-    let mut lines: Vec<Line<'static>> = Vec::with_capacity(visible * ROWS_PER_ITEM);
-    for i in app.list_offset..(app.list_offset + visible).min(app.feed.len()) {
+    let start = app.list_offset;
+    let end = (start + visible).min(app.feed.len());
+    app.list_above = start;
+    app.list_below = app.feed.len().saturating_sub(end);
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity((end - start) * ROWS_PER_ITEM);
+
+    for i in start..end {
         let item = &app.feed[i];
         let active = i == app.cursor;
+        let read = app.read.contains(&item.id);
 
-        let (mark, mark_style, title_style) = if active {
-            (
-                "▸ ",
-                Style::default().fg(theme::ACCENT),
-                Style::default()
-                    .fg(theme::TEXT)
-                    .add_modifier(Modifier::BOLD),
-            )
+        // 行首标记：光标 ▸ / 读过 · / 未读留白
+        let (mark, mark_style) = if active {
+            ("▸ ", Style::default().fg(theme::ACCENT))
+        } else if read {
+            ("· ", Style::default().fg(theme::FAINT))
         } else {
-            ("  ", Style::default().fg(theme::FAINT), Style::default().fg(theme::TEXT))
+            ("  ", Style::default().fg(theme::FAINT))
+        };
+
+        let title_style = if active {
+            Style::default().fg(theme::TEXT).add_modifier(Modifier::BOLD)
+        } else if read {
+            Style::default().fg(theme::FAINT)
+        } else {
+            Style::default().fg(theme::TEXT)
         };
 
         let title = text::truncate(&text::one_line(item.headline()), width.saturating_sub(3));
@@ -59,6 +73,7 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
             Span::styled(title, title_style),
         ]));
 
+        // 次行：作者/数据/摘要，摘要再压一档颜色，形成三级层次
         let mut segs: Vec<String> = Vec::new();
         if !item.author.is_empty() {
             segs.push(item.author.clone());
@@ -74,19 +89,40 @@ pub fn draw(f: &mut Frame, app: &mut App, area: Rect) {
         if item.comments > 0 {
             segs.push(format!("{} 评论", text::compact_num(item.comments)));
         }
-        segs.push(text::one_line(&item.excerpt));
-        let meta = segs
-            .into_iter()
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join(" · ");
+        let head = segs.join(" · ");
+        let head_style = if read {
+            Style::default().fg(theme::FAINT)
+        } else {
+            Style::default().fg(theme::DIM)
+        };
 
-        let meta = text::truncate(&meta, width.saturating_sub(3));
-        lines.push(Line::from(Span::styled(
-            format!("  {meta}"),
-            Style::default().fg(theme::DIM),
-        )));
+        let avail = width.saturating_sub(3);
+        let excerpt = text::one_line(&item.excerpt);
+        let mut spans = vec![Span::styled("  ", Style::default())];
+
+        let head_w = text::width(&head);
+        if head.is_empty() {
+            spans.push(Span::styled(
+                text::truncate(&excerpt, avail),
+                Style::default().fg(theme::FAINT),
+            ));
+        } else if head_w + 6 < avail {
+            spans.push(Span::styled(head, head_style));
+            if !excerpt.is_empty() {
+                spans.push(Span::styled("  ·  ", Style::default().fg(theme::FAINT)));
+                spans.push(Span::styled(
+                    text::truncate(&excerpt, avail - head_w - 5),
+                    Style::default().fg(theme::FAINT),
+                ));
+            }
+        } else {
+            spans.push(Span::styled(text::truncate(&head, avail), head_style));
+        }
+        lines.push(Line::from(spans));
+
+        lines.push(Line::from(""));
     }
 
     f.render_widget(Paragraph::new(Text::from(lines)), area);
 }
+

@@ -1,6 +1,7 @@
 mod app;
 mod bridge;
 mod config;
+mod state;
 mod term;
 mod text;
 mod ui;
