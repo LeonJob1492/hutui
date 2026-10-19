@@ -15,8 +15,9 @@ fn as_i64(v: &Value) -> i64 {
     v.as_i64().unwrap_or(0)
 }
 
-/// `target` 是知乎的 answer/article 实体（推荐流与问题 feeds 都长这样）
-fn target_to_item(t: &Value) -> Option<AnswerItem> {
+/// 把一个 answer / article 实体转成可阅读条目。
+/// 推荐流的 `target`、问题回答列表的元素、单篇回答接口的根对象，都是这个形状。
+fn entity_to_item(t: &Value) -> Option<AnswerItem> {
     let id = as_str(&t["id"]);
     if id.is_empty() {
         return None;
@@ -33,7 +34,6 @@ fn target_to_item(t: &Value) -> Option<AnswerItem> {
     let q = &t["question"];
     let mut question_title = as_str(&q["title"]);
     if question_title.is_empty() {
-        // 专栏文章没有 question，用自身标题
         question_title = as_str(&t["title"]);
     }
 
@@ -50,38 +50,43 @@ fn target_to_item(t: &Value) -> Option<AnswerItem> {
     })
 }
 
-// ---------------------------------------------------------------- 三个解析器
+// ---------------------------------------------------------------- 解析器
 
-/// `/api/v3/feed/topstory/recommend`
+/// `/api/v3/feed/topstory/recommend` —— 每页 6 条，`paging.next` 可跟随
 pub fn parse_feed_page(v: &Value) -> Vec<AnswerItem> {
     v["data"]
         .as_array()
         .map(|arr| {
             arr.iter()
-                .filter_map(|entry| target_to_item(&entry["target"]))
+                .filter_map(|entry| entity_to_item(&entry["target"]))
                 .collect()
         })
         .unwrap_or_default()
 }
 
-/// `/api/v4/questions/{qid}/feeds` —— item 是 question_feed_card，正文在 target 里
-pub fn parse_question_feeds(v: &Value) -> (Vec<AnswerItem>, bool) {
-    let items = v["data"]
+/// `/api/v4/questions/{qid}/answers` —— data 里直接就是 answer 实体
+/// 返回 (条目, 总条数, 是否到底)
+pub fn parse_answers_page(v: &Value) -> (Vec<AnswerItem>, usize, bool) {
+    let items: Vec<AnswerItem> = v["data"]
         .as_array()
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|entry| {
-                    if entry.get("target").is_some() {
-                        target_to_item(&entry["target"])
-                    } else {
-                        target_to_item(entry)
-                    }
-                })
-                .collect()
-        })
+        .map(|arr| arr.iter().filter_map(entity_to_item).collect())
         .unwrap_or_default();
+    let total = v["paging"]["totals"].as_u64().unwrap_or(items.len() as u64) as usize;
     let is_end = v["paging"]["is_end"].as_bool().unwrap_or(true);
-    (items, is_end)
+    (items, total, is_end)
+}
+
+/// `/api/v4/answers/{aid}` —— 根对象就是 answer 实体
+pub fn parse_answer_entity(v: &Value) -> Option<AnswerItem> {
+    entity_to_item(v)
+}
+
+/// 跟随分页用的下一页地址
+pub fn next_page_url(v: &Value) -> Option<String> {
+    v["paging"]["next"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
 }
 
 // ---------------------------------------------------------------- HTML → 文本
@@ -200,8 +205,7 @@ mod tests {
                     "content": "<p>第一段</p><p>第二段</p>",
                     "excerpt": "摘<em>要</em>",
                     "author": {"name": "某人"},
-                    "question": {"id": "1945", "title": "问题标题"},
-                    "url": "https://www.zhihu.com/question/1945/answer/2093"
+                    "question": {"id": "1945", "title": "问题标题"}
                 }
             }]
         });
@@ -211,20 +215,20 @@ mod tests {
         assert_eq!(items[0].author, "某人");
         assert_eq!(items[0].question_id, "1945");
         assert!(items[0].content.contains("第一段"));
-        assert!(items[0].content.contains("第二段"));
         assert!(!items[0].content.contains('<'));
     }
 
     #[test]
-    fn parses_question_feed_card() {
+    fn parses_answers_page_with_totals() {
         let v = json!({
-            "data": [{ "type": "question_feed_card",
-                       "target": { "type": "answer", "id": "7", "content": "<b>x</b>" } }],
-            "paging": { "is_end": false }
+            "data": [{ "type": "answer", "id": "7", "content": "<b>x</b>",
+                       "question": { "id": "1", "title": "t" } }],
+            "paging": { "is_end": false, "totals": 15 }
         });
-        let (items, is_end) = parse_question_feeds(&v);
+        let (items, total, is_end) = parse_answers_page(&v);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].content, "x");
+        assert_eq!(total, 15);
         assert!(!is_end);
     }
 

@@ -1,24 +1,27 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, bail, Result};
 use serde_json::json;
 use std::sync::mpsc::{Receiver, Sender};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use super::cdp::{Capture, Cdp};
+use super::cdp::Cdp;
 use super::{chrome, Cmd, Event};
 use crate::config;
 use crate::zhihu::parse;
 use crate::zhihu::AnswerItem;
 
 const HOME: &str = "https://www.zhihu.com";
-/// 注意是 v3，不是 v4：只过滤 /api/v4/ 会把它整个漏掉
-const FEED_API: &str = "/api/v3/feed/topstory/recommend";
+const FEED_URL: &str = "https://www.zhihu.com/api/v3/feed/topstory/recommend?limit=10&desktop=true";
+/// 单篇回答要的字段
+const ANSWER_INCLUDE: &str = "content,excerpt,author,voteup_count,comment_count,question";
+/// 回答列表要的字段
+const LIST_INCLUDE: &str = "data[*].content,excerpt,author,voteup_count,comment_count,question";
 
 pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
     let mut ctx = Ctx::default();
     while let Ok(cmd) = rx.recv() {
         let result = match cmd {
             Cmd::LoadFeed { want } => ctx.load_feed(&tx, want),
-            Cmd::LoadAnswers { qid } => ctx.load_answers(&tx, &qid),
+            Cmd::OpenAnswer { qid, aid } => ctx.open_answer(&tx, &qid, &aid),
         };
         if let Err(e) = result {
             let _ = tx.send(Event::Error(format!("{e:#}")));
@@ -30,6 +33,14 @@ pub fn run(rx: Receiver<Cmd>, tx: Sender<Event>) {
 struct Ctx {
     cdp: Option<Cdp>,
     session: Option<String>,
+}
+
+/// include 参数里的方括号星号要转义，否则页面 fetch 会当成通配
+fn enc(include: &str) -> String {
+    include
+        .replace('[', "%5B")
+        .replace(']', "%5D")
+        .replace('*', "%2A")
 }
 
 impl Ctx {
@@ -44,12 +55,12 @@ impl Ctx {
         let _ = tx.send(Event::Status("连接调试端口…".into()));
         let mut cdp = Cdp::connect(config::CDP_PORT)?;
 
-        let created = cdp.call("Target.createTarget", json!({ "url": "about:blank" }), None)?;
+        // 直接建一个知乎页当同源上下文：fetch 必须在 zhihu.com 源下才带得上 cookie
+        let created = cdp.call("Target.createTarget", json!({ "url": format!("{HOME}/") }), None)?;
         let target_id = created["targetId"]
             .as_str()
             .ok_or_else(|| anyhow!("createTarget 没返回 targetId"))?
             .to_string();
-
         let attached = cdp.call(
             "Target.attachToTarget",
             json!({ "targetId": target_id, "flatten": true }),
@@ -59,112 +70,130 @@ impl Ctx {
             .as_str()
             .ok_or_else(|| anyhow!("attachToTarget 没返回 sessionId"))?
             .to_string();
-
-        cdp.call(
-            "Network.enable",
-            json!({ "maxTotalBufferSize": 200_000_000u64, "maxResourceBufferSize": 60_000_000u64 }),
-            Some(&session),
-        )?;
-        cdp.call("Page.enable", json!({}), Some(&session))?;
         cdp.call("Runtime.enable", json!({}), Some(&session))?;
 
         self.cdp = Some(cdp);
         self.session = Some(session);
+        self.wait_origin(tx)?;
         Ok(())
     }
 
-    fn session(&self) -> Result<&str> {
-        self.session
-            .as_deref()
-            .ok_or_else(|| anyhow!("桥接尚未建立会话"))
+    /// 等页面真正落到 zhihu.com 域，否则 fetch 会被 CORS 挡掉
+    fn wait_origin(&mut self, tx: &Sender<Event>) -> Result<()> {
+        let _ = tx.send(Event::Status("等待知乎页面就绪…".into()));
+        let session = self
+            .session
+            .clone()
+            .ok_or_else(|| anyhow!("桥接尚未建立会话"))?;
+        let deadline = Instant::now() + Duration::from_secs(25);
+        while Instant::now() < deadline {
+            let cdp = self.cdp.as_mut().ok_or_else(|| anyhow!("桥接未连接"))?;
+            if let Ok(r) = cdp.call(
+                "Runtime.evaluate",
+                json!({ "expression": "location.origin", "returnByValue": true }),
+                Some(&session),
+            ) {
+                if r["result"]["value"].as_str() == Some(HOME) {
+                    return Ok(());
+                }
+            }
+            std::thread::sleep(Duration::from_millis(300));
+        }
+        bail!("知乎页面在 25s 内没就绪，检查 profile 登录态")
     }
 
+    fn fetch(&mut self, url: &str) -> Result<serde_json::Value> {
+        let session = self
+            .session
+            .clone()
+            .ok_or_else(|| anyhow!("桥接尚未建立会话"))?;
+        let cdp = self.cdp.as_mut().ok_or_else(|| anyhow!("桥接未连接"))?;
+        cdp.fetch_json(&session, url)
+    }
+
+    /// 推荐流：首页一页 6 条，之后跟着 paging.next 翻
     fn load_feed(&mut self, tx: &Sender<Event>, want: usize) -> Result<()> {
         self.ensure(tx)?;
-        let session = self.session()?.to_string();
-        let cdp = self.cdp.as_mut().ok_or_else(|| anyhow!("桥接未连接"))?;
-
-        let _ = tx.send(Event::Status("打开推荐流…".into()));
-        cdp.navigate(&session, &format!("{HOME}/"))?;
+        let _ = tx.send(Event::Status("拉取推荐流…".into()));
 
         let mut acc: Vec<AnswerItem> = Vec::new();
+        let mut url = FEED_URL.to_string();
 
-        let caps = cdp.capture_json(
-            &session,
-            &[FEED_API],
-            Duration::from_millis(config::FEED_TIMEOUT_MS),
-        )?;
-        absorb_feed(&caps, &mut acc);
-        let _ = tx.send(Event::Feed(acc.clone()));
-
-        for _ in 0..config::FEED_PAGE_SCROLLS {
+        for _ in 0..config::FEED_MAX_PAGES {
+            let v = self.fetch(&url)?;
+            let items = parse::parse_feed_page(&v);
+            if items.is_empty() {
+                break;
+            }
+            append_unique(&mut acc, items);
+            let _ = tx.send(Event::Feed(acc.clone()));
             if acc.len() >= want {
                 break;
             }
-            cdp.scroll(&session, 2200)?;
-            std::thread::sleep(Duration::from_millis(900));
-            let caps = cdp.capture_json(
-                &session,
-                &[FEED_API],
-                Duration::from_millis(config::PAGE_TIMEOUT_MS),
-            )?;
-            absorb_feed(&caps, &mut acc);
-            let _ = tx.send(Event::Feed(acc.clone()));
+            match parse::next_page_url(&v) {
+                Some(next) => url = next,
+                None => break,
+            }
         }
 
         let _ = tx.send(Event::Status(format!("{} items", acc.len())));
         Ok(())
     }
 
-    fn load_answers(&mut self, tx: &Sender<Event>, qid: &str) -> Result<()> {
+    /// a：当前这条回答；b：该问题下的回答列表
+    fn open_answer(&mut self, tx: &Sender<Event>, qid: &str, aid: &str) -> Result<()> {
         self.ensure(tx)?;
-        let session = self.session()?.to_string();
-        let cdp = self.cdp.as_mut().ok_or_else(|| anyhow!("桥接未连接"))?;
 
-        let api = format!("/api/v4/questions/{qid}/feeds");
-        let _ = tx.send(Event::Status("拉同问题回答…".into()));
-        // 问题页滚动会自动翻页；回答页要点按钮，所以走问题页
-        cdp.navigate(&session, &format!("{HOME}/question/{qid}"))?;
-
-        let mut acc: Vec<AnswerItem> = Vec::new();
-        let mut is_end = false;
-
-        for _ in 0..=config::ANSWER_PAGE_SCROLLS {
-            let caps = cdp.capture_json(
-                &session,
-                &[api.as_str()],
-                Duration::from_millis(if acc.is_empty() {
-                    config::FEED_TIMEOUT_MS
-                } else {
-                    config::PAGE_TIMEOUT_MS
-                }),
-            )?;
-            for c in &caps {
-                let (items, end) = parse::parse_question_feeds(&c.body);
-                is_end = end;
-                append_unique(&mut acc, items);
+        // ---- a
+        let _ = tx.send(Event::Status("拉取这条回答…".into()));
+        let url = format!("{HOME}/api/v4/answers/{aid}?include={}", enc(ANSWER_INCLUDE));
+        match self.fetch(&url) {
+            Ok(v) => {
+                if let Some(item) = parse::parse_answer_entity(&v) {
+                    let _ = tx.send(Event::Answer(item));
+                }
             }
-            let _ = tx.send(Event::Answers {
-                items: acc.clone(),
-                is_end,
-            });
-            if is_end || acc.len() >= config::STREAM_MAX {
-                break;
+            Err(e) => {
+                // 单篇失败不影响列表，列表拿到也能读
+                let _ = tx.send(Event::Status(format!("这条回答取不到：{e}")));
             }
-            cdp.evaluate(
-                &session,
-                "window.scrollTo(0, document.documentElement.scrollHeight)",
-            )?;
-            std::thread::sleep(Duration::from_millis(1200));
         }
 
-        Ok(())
-    }
-}
+        // ---- b
+        if qid.is_empty() {
+            let _ = tx.send(Event::Status("这条没有所属问题".into()));
+            return Ok(());
+        }
 
-fn absorb_feed(caps: &[Capture], acc: &mut Vec<AnswerItem>) {
-    for c in caps {
-        append_unique(acc, parse::parse_feed_page(&c.body));
+        let _ = tx.send(Event::Status("拉取同问题回答…".into()));
+        let mut acc: Vec<AnswerItem> = Vec::new();
+        let mut offset = 0usize;
+        let limit = config::ANSWERS_PAGE as usize;
+
+        // 接口的 paging.totals 直接给出总数，翻到 is_end 或触顶就停
+        let total = loop {
+            let url = format!(
+                "{HOME}/api/v4/questions/{qid}/answers?include={}&offset={offset}&limit={limit}&order=default&platform=desktop",
+                enc(LIST_INCLUDE)
+            );
+            let v = self.fetch(&url)?;
+            let (items, total, is_end) = parse::parse_answers_page(&v);
+            if items.is_empty() {
+                break total;
+            }
+            offset += items.len();
+            append_unique(&mut acc, items);
+            let _ = tx.send(Event::Answers {
+                items: acc.clone(),
+                total,
+            });
+            if is_end || acc.len() >= config::STREAM_MAX {
+                break total;
+            }
+        };
+
+        let _ = tx.send(Event::Status(format!("{total} 条回答")));
+        Ok(())
     }
 }
 

@@ -1,5 +1,6 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::text::Line;
+use std::collections::HashMap;
 use std::sync::mpsc::Sender;
 use std::time::{Duration, Instant};
 
@@ -28,12 +29,14 @@ pub struct App {
     // ---- 阅读：一条一屏，↑↓ 换条
     pub stream: Vec<AnswerItem>,
     pub index: usize,
+    /// 该问题下回答总数（接口给的 paging.totals）
+    pub total: usize,
     /// 当前这条回答摊平后的行
     pub lines: Vec<Line<'static>>,
     /// 当前这条回答内的滚动位置
     pub scroll: usize,
-    /// 每条回答各自的滚动位置，切回来时不丢
-    pub scrolls: Vec<usize>,
+    /// 按回答 id 记住各自的滚动位置，切回来不丢
+    scroll_by_id: HashMap<String, usize>,
 
     // ---- 布局
     pub built_width: u16,
@@ -55,9 +58,10 @@ impl App {
             list_offset: 0,
             stream: Vec::new(),
             index: 0,
+            total: 0,
             lines: Vec::new(),
             scroll: 0,
-            scrolls: Vec::new(),
+            scroll_by_id: HashMap::new(),
             built_width: 0,
             body_h: 0,
             status: "连接中…".into(),
@@ -134,7 +138,7 @@ impl App {
         }
     }
 
-    /// 阅读视图：↑↓ 换回答；单条答案比一屏长时用 PgUp/PgDn 在条内滚。
+    /// 阅读视图：↑↓ 换回答；单条比一屏长时用 PgUp/PgDn 在条内滚。
     fn on_key_reading(&mut self, k: KeyEvent) {
         let page = (self.body_h.saturating_sub(1) as usize).max(1);
         match k.code {
@@ -168,10 +172,11 @@ impl App {
         let Some(item) = self.feed.get(self.cursor).cloned() else {
             return;
         };
+        // 先用列表里已有的正文秒开，随后由 a 覆盖成权威内容
         self.stream = vec![item.clone()];
         self.index = 0;
+        self.total = 1;
         self.scroll = 0;
-        self.scrolls = vec![0];
         self.view = View::Reading;
         self.resume = View::Reading;
         self.rebuild();
@@ -179,11 +184,12 @@ impl App {
         if item.question_id.is_empty() {
             self.status = "单篇".into();
         } else {
-            self.status = "拉同问题回答…".into();
-            let _ = self.tx.send(Cmd::LoadAnswers {
-                qid: item.question_id.clone(),
-            });
+            self.status = "拉取回答…".into();
         }
+        let _ = self.tx.send(Cmd::OpenAnswer {
+            qid: item.question_id.clone(),
+            aid: item.id.clone(),
+        });
     }
 
     fn back_to_list(&mut self) {
@@ -197,10 +203,8 @@ impl App {
         if self.stream.is_empty() {
             return;
         }
-        if self.scrolls.len() != self.stream.len() {
-            self.scrolls.resize(self.stream.len(), 0);
-        }
-        self.scrolls[self.index] = self.scroll;
+        let cur_id = self.stream[self.index].id.clone();
+        self.scroll_by_id.insert(cur_id, self.scroll);
 
         let next = if delta < 0 {
             self.index.saturating_sub(delta.unsigned_abs())
@@ -216,7 +220,7 @@ impl App {
             return;
         }
         self.index = next;
-        self.scroll = *self.scrolls.get(next).unwrap_or(&0);
+        self.scroll = *self.scroll_by_id.get(&self.stream[next].id).unwrap_or(&0);
         self.rebuild();
     }
 
@@ -242,10 +246,11 @@ impl App {
 
     pub fn rebuild(&mut self) {
         let w = self.built_width.max(24);
+        let shown = self.total.max(self.stream.len());
         self.lines = self
             .stream
             .get(self.index)
-            .map(|item| ui::reading::build(item, self.index, self.stream.len(), w))
+            .map(|item| ui::reading::build(item, self.index, shown, w))
             .unwrap_or_default();
         let max = self.max_scroll();
         if self.scroll > max {
@@ -253,12 +258,12 @@ impl App {
         }
     }
 
-    /// 当前读到第几条（给 header 用）
+    /// 当前读到第几条（给 header 用）：(从 0 开始的序号, 总数)
     pub fn current_answer(&self) -> Option<(usize, usize)> {
         if self.stream.is_empty() {
             return None;
         }
-        Some((self.index, self.stream.len()))
+        Some((self.index, self.total.max(self.stream.len())))
     }
 
     /// 条内滚动进度：(已滚, 总可滚)，给 footer 用
@@ -275,6 +280,7 @@ impl App {
     pub fn on_bridge(&mut self, ev: BridgeEvent) {
         match ev {
             BridgeEvent::Status(s) => self.status = s,
+
             BridgeEvent::Feed(items) => {
                 self.feed = items;
                 if self.cursor >= self.feed.len() {
@@ -282,27 +288,45 @@ impl App {
                 }
                 self.status = format!("{} items", self.feed.len());
             }
-            BridgeEvent::Answers { items, is_end } => {
-                let mut added = 0usize;
-                for it in items {
-                    if self.stream.len() >= config::STREAM_MAX {
-                        break;
-                    }
-                    if it.content.is_empty() || self.stream.iter().any(|x| x.id == it.id) {
-                        continue;
-                    }
-                    self.stream.push(it);
-                    self.scrolls.push(0);
-                    added += 1;
-                }
-                // 当前这条没变，不需要重建；只是总数变了
-                let _ = added;
-                self.status = if is_end {
-                    format!("{} 条回答 · 已到底", self.stream.len())
+
+            // a：当前这条回答的权威内容
+            BridgeEvent::Answer(item) => {
+                if let Some(slot) = self.stream.iter_mut().find(|x| x.id == item.id) {
+                    *slot = item;
                 } else {
-                    format!("{} 条回答", self.stream.len())
-                };
+                    let at = self.index.min(self.stream.len());
+                    self.stream.insert(at, item);
+                }
+                self.rebuild();
             }
+
+            // b：该问题下的回答列表，按接口顺序重排并把当前这条定位到它自己的位置
+            BridgeEvent::Answers { items, total } => {
+                self.total = total.max(items.len());
+                let cur_id = self
+                    .stream
+                    .get(self.index)
+                    .map(|x| x.id.clone())
+                    .unwrap_or_default();
+
+                let mut ordered = items;
+                if !cur_id.is_empty() && !ordered.iter().any(|x| x.id == cur_id) {
+                    if let Some(cur) = self.stream.get(self.index).cloned() {
+                        ordered.insert(0, cur);
+                    }
+                }
+                let scroll = self.scroll_by_id.get(&cur_id).copied().unwrap_or(0);
+                self.stream = ordered;
+                self.index = self
+                    .stream
+                    .iter()
+                    .position(|x| x.id == cur_id)
+                    .unwrap_or(0);
+                self.scroll = scroll;
+                self.rebuild();
+                self.status = format!("{} 条回答", self.total);
+            }
+
             BridgeEvent::Error(e) => self.status = format!("× {e}"),
         }
     }

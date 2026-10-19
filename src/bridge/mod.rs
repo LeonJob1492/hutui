@@ -9,7 +9,8 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 #[derive(Debug, Clone)]
 pub enum Cmd {
     LoadFeed { want: usize },
-    LoadAnswers { qid: String },
+    /// a = 当前这条回答的权威内容，b = 该问题下的回答列表
+    OpenAnswer { qid: String, aid: String },
 }
 
 /// 工作线程 → 主线程
@@ -17,7 +18,10 @@ pub enum Cmd {
 pub enum Event {
     Status(String),
     Feed(Vec<AnswerItem>),
-    Answers { items: Vec<AnswerItem>, is_end: bool },
+    /// 当前这条回答
+    Answer(AnswerItem),
+    /// 该问题下的回答列表（增量）
+    Answers { items: Vec<AnswerItem>, total: usize },
     Error(String),
 }
 

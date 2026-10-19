@@ -6,16 +6,13 @@ pub const CDP_PORT: u16 = 9222;
 pub const WINDOW_SIZE: &str = "1100,760";
 /// 伪装窗口标题（OSC 2）
 pub const APP_TITLE: &str = "handler.rs — gateway";
-/// 列表首次预取目标条数
+
+/// 列表预取目标条数
 pub const FEED_TARGET: usize = 42;
-/// 列表最多补几页
-pub const FEED_PAGE_SCROLLS: usize = 9;
-/// 同问题回答最多补几页
-pub const ANSWER_PAGE_SCROLLS: usize = 4;
-/// 首屏捕获窗口
-pub const FEED_TIMEOUT_MS: u64 = 11_000;
-/// 每个补页捕获窗口
-pub const PAGE_TIMEOUT_MS: u64 = 2_800;
+/// 推荐流最多跟几页（每页 6 条）
+pub const FEED_MAX_PAGES: usize = 12;
+/// 回答列表每页条数
+pub const ANSWERS_PAGE: usize = 20;
 /// 阅读流硬上限
 pub const STREAM_MAX: usize = 50;
 

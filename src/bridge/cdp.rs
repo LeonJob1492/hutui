@@ -1,6 +1,7 @@
-//! 极简 CDP 客户端：WebSocket + JSON-RPC，够用就好。
+//! 极简 CDP 客户端：WebSocket + JSON-RPC。
 //!
-//! 只用 `Network` / `Page` / `Input` / `Target` / `Runtime` 几个域。
+//! 只做两件事：连上一个真实的 Chrome，然后在页面上下文里发 `fetch` 取 JSON。
+//! 不模拟点击、不模拟滚动、不解析 DOM。
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde_json::{json, Value};
@@ -11,15 +12,10 @@ use std::time::{Duration, Instant};
 use tungstenite::stream::MaybeTlsStream;
 use tungstenite::{Message, WebSocket};
 
-pub struct Capture {
-    pub body: Value,
-}
-
 pub struct Cdp {
     ws: WebSocket<MaybeTlsStream<TcpStream>>,
     next_id: u64,
     responses: HashMap<u64, Value>,
-    events: Vec<Value>,
 }
 
 fn discover_ws_url(port: u16) -> Result<String> {
@@ -58,10 +54,7 @@ fn discover_ws_url(port: u16) -> Result<String> {
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                ) =>
-            {
-                // 端点还没吐完整 body，继续等
-            }
+                ) => {}
             Err(e) => return Err(e.into()),
         }
     }
@@ -72,6 +65,10 @@ fn discover_ws_url(port: u16) -> Result<String> {
         .as_str()
         .map(str::to_string)
         .ok_or_else(|| anyhow!("调试端口没返回 webSocketDebuggerUrl"))
+}
+
+fn brief(url: &str) -> String {
+    url.splitn(2, "zhihu.com").nth(1).unwrap_or(url).chars().take(80).collect()
 }
 
 impl Cdp {
@@ -85,7 +82,6 @@ impl Cdp {
             ws,
             next_id: 0,
             responses: HashMap::new(),
-            events: Vec::new(),
         })
     }
 
@@ -108,13 +104,10 @@ impl Cdp {
         };
         if let Some(id) = v.get("id").and_then(Value::as_u64) {
             self.responses.insert(id, v);
-        } else if v.get("method").is_some() {
-            self.events.push(v);
         }
     }
 
-    /// 读一段时间，把响应与事件都收进队列
-    pub fn pump(&mut self, dur: Duration) -> Result<()> {
+    fn pump(&mut self, dur: Duration) -> Result<()> {
         let deadline = Instant::now() + dur;
         while Instant::now() < deadline {
             match self.ws.read() {
@@ -139,7 +132,7 @@ impl Cdp {
 
     pub fn call(&mut self, method: &str, params: Value, session: Option<&str>) -> Result<Value> {
         let id = self.push(method, params, session)?;
-        let deadline = Instant::now() + Duration::from_secs(25);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             if let Some(v) = self.responses.remove(&id) {
                 if let Some(err) = v.get("error") {
@@ -150,132 +143,47 @@ impl Cdp {
             if Instant::now() > deadline {
                 bail!("CDP {method} 超时");
             }
-            self.pump(Duration::from_millis(50))?;
+            self.pump(Duration::from_millis(30))?;
         }
     }
 
-    /// 等待 `dur` 长的时间窗口，收集所有命中 `url_contains` 的 JSON 响应体。
+    /// 在页面上下文里 `fetch(url)` 并把响应体当 JSON 返回。
     ///
-    /// 我们不发请求 —— 只是让页面自己跑，然后把它自己拉的 JSON 搬回来。
-    /// 一旦有命中，再给 `grace` 的宽限就提前返回，避免傻等满窗口。
-    pub fn capture_json(
-        &mut self,
-        session: &str,
-        url_contains: &[&str],
-        dur: Duration,
-    ) -> Result<Vec<Capture>> {
-        const GRACE: Duration = Duration::from_millis(700);
-        let deadline = Instant::now() + dur;
-        let mut first_hit: Option<Instant> = None;
-        let mut seen = 0usize;
+    /// 用的是页面自己的同源上下文和登录 cookie —— 不做任何签名伪造，
+    /// 这些接口本身也不校验签名（实测）。
+    pub fn fetch_json(&mut self, session: &str, url: &str) -> Result<Value> {
+        let quoted = serde_json::to_string(url)?;
+        let expr = format!(
+            "(async () => {{ \
+               try {{ \
+                 const r = await fetch({quoted}, {{ credentials: 'include' }}); \
+                 const t = await r.text(); \
+                 return {{ ok: r.ok, status: r.status, text: t }}; \
+               }} catch (e) {{ return {{ ok: false, status: 0, text: String(e) }}; }} \
+             }})()"
+        );
 
-        loop {
-            self.pump(Duration::from_millis(120))?;
-
-            let n = self.count_hits(session, url_contains);
-            if n > seen {
-                seen = n;
-                first_hit.get_or_insert_with(Instant::now);
-            }
-            if let Some(t) = first_hit {
-                if t.elapsed() >= GRACE {
-                    break;
-                }
-            }
-            if Instant::now() >= deadline {
-                break;
-            }
-        }
-
-        let events = std::mem::take(&mut self.events);
-
-        let mut url_by_req: HashMap<String, String> = HashMap::new();
-        let mut finished: Vec<String> = Vec::new();
-
-        for e in &events {
-            if e.get("sessionId").and_then(Value::as_str) != Some(session) {
-                continue;
-            }
-            let method = e.get("method").and_then(Value::as_str).unwrap_or("");
-            let p = &e["params"];
-            match method {
-                "Network.responseReceived" => {
-                    let url = p["response"]["url"].as_str().unwrap_or("");
-                    if url_contains.iter().any(|needle| url.contains(needle)) {
-                        let rid = p["requestId"].as_str().unwrap_or("").to_string();
-                        if !rid.is_empty() {
-                            url_by_req.insert(rid, url.to_string());
-                        }
-                    }
-                }
-                "Network.loadingFinished" => {
-                    let rid = p["requestId"].as_str().unwrap_or("").to_string();
-                    if url_by_req.contains_key(&rid) {
-                        finished.push(rid);
-                    }
-                }
-                _ => {}
-            }
-        }
-
-        let mut out = Vec::new();
-        for rid in finished {
-            let Ok(res) = self.call(
-                "Network.getResponseBody",
-                json!({ "requestId": rid }),
-                Some(session),
-            ) else {
-                continue;
-            };
-            if res["base64Encoded"].as_bool().unwrap_or(false) {
-                continue;
-            }
-            let body = res["body"].as_str().unwrap_or("");
-            if let Ok(json) = serde_json::from_str::<Value>(body) {
-                out.push(Capture { body: json });
-            }
-        }
-        Ok(out)
-    }
-
-    fn count_hits(&self, session: &str, url_contains: &[&str]) -> usize {
-        self.events
-            .iter()
-            .filter(|e| e.get("sessionId").and_then(Value::as_str) == Some(session))
-            .filter(|e| {
-                e.get("method").and_then(Value::as_str) == Some("Network.responseReceived")
-            })
-            .filter(|e| {
-                let url = e["params"]["response"]["url"].as_str().unwrap_or("");
-                url_contains.iter().any(|n| url.contains(n))
-            })
-            .count()
-    }
-
-    /// 在页面里求值（只读用途）
-    pub fn evaluate(&mut self, session: &str, expr: &str) -> Result<Value> {
-        self.call(
+        let res = self.call(
             "Runtime.evaluate",
-            json!({ "expression": expr, "returnByValue": true }),
-            Some(session),
-        )
-    }
-
-    pub fn scroll(&mut self, session: &str, dy: i64) -> Result<()> {
-        self.call(
-            "Input.dispatchMouseEvent",
-            json!({
-                "type": "mouseWheel",
-                "x": 520, "y": 380,
-                "deltaX": 0, "deltaY": dy
-            }),
+            json!({ "expression": expr, "returnByValue": true, "awaitPromise": true }),
             Some(session),
         )?;
-        Ok(())
-    }
 
-    pub fn navigate(&mut self, session: &str, url: &str) -> Result<()> {
-        self.call("Page.navigate", json!({ "url": url }), Some(session))?;
-        Ok(())
+        let val = &res["result"]["value"];
+        if val.is_null() {
+            let detail = res
+                .get("exceptionDetails")
+                .map(|d| d.to_string())
+                .unwrap_or_else(|| "无返回值".into());
+            bail!("页面求值失败: {detail}");
+        }
+
+        let status = val["status"].as_i64().unwrap_or(0);
+        let text = val["text"].as_str().unwrap_or("");
+        if status != 200 {
+            let head: String = text.chars().take(160).collect();
+            bail!("{} → HTTP {status}: {head}", brief(url));
+        }
+        serde_json::from_str(text).with_context(|| format!("{} 返回的不是 JSON", brief(url)))
     }
 }

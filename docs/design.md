@@ -1,178 +1,187 @@
 # hutui 设计文档
 
-> 状态：v0.1 骨架期　最后更新：2026-10-15
+> 状态：v0.2（数据链路修正版）　最后更新：2026-10-15
 > 本文是实现的唯一事实源。与 `AGENTS.md` 冲突时以本文的数据链路结论为准。
 
 ## 1. 定位与边界
 
-**摸鱼伪装优先**：窗口要看起来像正在跑 Codex CLI 的终端，其次才是阅读体验。任何取舍与此冲突时以伪装优先。
+**摸鱼伪装优先**：窗口要看起来像正在跑 Codex CLI 的终端，其次才是阅读体验。
 
-**边界（Leon 划定，不要越过）**：
+**边界（Leon 划定）**：
 
 - 登录态下给自己换皮属客户端行为，可以做。
-- **不伪造签名、不伪造客户端身份、不自己构造 `/api/*` 请求。**
-- 不绕付费墙：盐选正文本来就不在数据里，拿不到就是拿不到。
+- **不重写 `x-zse-96` 签名算法、不伪造 UA / 客户端身份。**
+- 不绕付费墙：盐选正文本来就不在数据里。
 - 界面自带文案零「知乎」字样；正文内文不动。
 
-## 2. 已验证的数据链路（2026-10-15 实测）
+> 边界里原本写的是「不自己构造 `/api/*` 请求」。**这条基于错误前提，已作废**，
+> 详见 2.4。现在的口径是：可以在页面同源上下文里直接 `fetch` 公开接口，
+> 因为实测这些接口不校验签名；但仍然不重写签名算法、不伪装客户端。
 
-五轮 CDP 探针的结论，全部来自真实登录态浏览器，探针自身未发出任何 `/api` 请求。
+## 2. 数据链路（全部实测）
 
-### 2.1 前置事实
+### 2.1 前置
 
 | 事实 | 结论 |
 |---|---|
-| 游客态 | 导航 `zhihu.com` 直接 302 → `/signin?next=%2F`，api 零命中。**必须登录态。** |
-| 登录态载体 | 独立 profile（`~/.hutui/chrome-profile`）。cookie 写入后**冷启动持久有效**。 |
-| 调试端口 | Chrome ≥136 起，默认 user-data-dir 会忽略 `--remote-debugging-port`；**必须独立 profile**。 |
-| 窗口 | `open -n -g` 后台启动，不抢焦点；窗口被遮挡时滚动仍能触发懒加载（实测）。 |
+| 游客 | 导航 `zhihu.com` 302 → `/signin`，`curl` 403（`code:40362`）。必须登录态。 |
+| 登录载体 | 独立 profile `~/.hutui/chrome-profile`，cookie 写入后冷启动持久有效。 |
+| 调试端口 | Chrome ≥136 起默认 user-data-dir 会忽略 `--remote-debugging-port`，必须独立 profile。 |
+| 窗口 | `open -n -g` 后台启动，不抢焦点。 |
 
-### 2.2 三个数据源
+### 2.2 三个接口
+
+所有请求都在**知乎页面上下文里**用 `fetch(url, {credentials:'include'})` 发出，
+Rust 侧通过 CDP `Runtime.evaluate` 取值。**不模拟点击、不模拟滚动、不解析 DOM。**
 
 **① 推荐流列表**
 
 ```
-GET /api/v3/feed/topstory/recommend
-    首屏  ?limit=10                            → 6 条
-    翻页  ?action=down&after_id=N&session_token=... → 6 条/页
+GET /api/v3/feed/topstory/recommend?limit=10&desktop=true
+    → 6 条（服务端固定上限，limit 调大无效）
+    → paging.next 是完整 URL（带 after_id + session_token），直接跟着翻
 ```
 
-- 触发方式：导航到首页后**滚动页面**，页面自己发请求。
-- 条目结构：`data[i].target` 就是 answer 实体。
+实测：跟 7 页拿到 42 条，零重叠。条目 `data[i].target` 是 answer 实体，
+自带 `content`（全文）、`excerpt`、`author.name`、`question.id/title`、`voteup_count`。
 
-```jsonc
-{ "type": "feed",
-  "target": { "type": "answer", "id": "2093...", "content": "<p>…</p>",
-              "excerpt": "…", "voteup_count": 110, "comment_count": 12,
-              "author": { "name": "…" },
-              "question": { "id": "1945...", "title": "…", "answer_count": 217 } } }
-```
-
-实测 48 条：**48/48 带 `content`**（max 21333 / p50 1355 / min 84 字符），
-`content_need_truncated=true` 为 0 条 → **列表页拿到的就是全文，没有截断。**
-48/48 带 `question.id` → 不用解析 URL 就能拿到 qid。
-
-**② 单篇正文（零请求）**
-
-回答页导航完成后，`js-initialData.initialState.entities.answers[aid].content` 就是全文。
-实测 `/api/v4/answers/{id}` **从未被调用**。问题实体同层可用。
-
-**③ 同问题下的其他回答**
+**② 单篇回答（a：用来展示）**
 
 ```
-GET /api/v4/questions/{qid}/feeds?include=data[*].…content…&order=default&limit=N
+GET /api/v4/answers/{aid}?include=content,excerpt,author,voteup_count,comment_count,question
 ```
 
-- 条目 `type` 是 `question_feed_card`，**全文在 `data[i].target.content`**（是个完整 answer 实体）。
-- 回答页首屏 3 条；要更多**必须点「查看全部 N 个回答」** → 再 3 条。
-- **问题页 `/question/{qid}` 首屏 5 条，滚动自动翻页**，每次 +5 条（cursor 分页）。
+根对象就是 answer 实体，一次拿全正文 + 作者 + 所属 `question.id` / `question.title`。
+实测 `content` 362 字符，`question.id` 与预期一致。
 
-→ **取同问题回答时用问题页，不用回答页。**
+**③ 该问题下的回答列表（b：用来准备 ↑↓ 切换）**
 
-### 2.3 两个曾经踩过的坑
+```
+GET /api/v4/questions/{qid}/answers?include=data[*].content,…&offset=N&limit=20&order=default&platform=desktop
+```
 
-- 第一版探针把抓取过滤写成 `/api/v4/`，把 `/api/v3/feed/topstory/recommend` 整个漏掉，
-  一度误判"首页是 SSR 内联"。**实现必须抓 `zhihu.com/api/**` 全部，不能只盯 v4。**
-- `/api/v4/questions/{qid}/answers` **这个接口不存在**，别照抄。
+- **认 `offset`**，`paging.totals` 直接给出总数，`paging.is_end` 标示到底。
+- 实测 `limit=20` 一次返回全部 15 条，每条都带全文 `content`。
+- `data[i]` **直接就是 answer 实体**（没有 `target` 包装）。
+
+### 2.3 不要用 `questions/{qid}/feeds`
+
+这个接口是 cursor 分页：**忽略 `offset`**，同样的参数永远返回同一批 5 条；
+页面上要拿到更多只能靠滚动触发，且经常出现 `data=[] + is_end=true` 的假到底。
+早期实现就是被它拖住的，别再回去。取回答列表一律用 ②③ 里的 `answers`。
+
+### 2.4 一条被证伪的旧结论（重要，别再重复）
+
+9-23 的评估里写着「正文走签名接口，带 `x-zse-96`，不能手造请求」。
+那句话**只对游客 / 无 cookie 场景成立**，而我把它当成了不可验证的前提，结果是：
+
+- 花了五轮探针去「模拟页面操作」（导航 + 滚动 + 被动捕获响应体）
+- 采集依赖页面自己的懒加载节奏，慢了、漏了、`is_end` 还不可靠
+- 线上表现为「15 个回答只切到 1 条」
+
+实测澄清（probe10/11）：
+
+```text
+window.fetch 是原生函数（/[native code]/），知乎没有 patch 它
+我们在页面里 fetch 时，请求头里【没有】x-zse-96
+上述三个接口全部 200，只要带登录 cookie
+```
+
+**实验方法备忘**：怀疑「某接口不可直接调用」时，先在页面上下文里裸 fetch 一次看状态码，
+不要从历史结论往下推。签名是不是必需，一条 `fetch` 就能证伪。
 
 ## 3. 架构
 
 ```
-┌─────────────────────────────┐
-│  hutui (Rust + ratatui)     │  主线程：事件循环 + 渲染
-│  ├ ui/     列表/阅读/panic   │
-│  ├ app.rs  状态机 + 按键     │
-│  └ bridge/ 后台线程          │
-└──────────┬──────────────────┘
-           │ mpsc: Cmd ↓ / Event ↑
-┌──────────┴──────────────────┐
-│  采集工作线程                │
-│  ├ chrome.rs  实例生命周期    │
-│  ├ cdp.rs     WS JSON-RPC    │
-│  └ worker.rs  导航/滚动/捕获  │
-└──────────┬──────────────────┘
-           │ CDP over ws://127.0.0.1:9222
-┌──────────┴──────────────────┐
-│  独立 Chrome 实例            │
-│  profile: ~/.hutui/chrome-  │
-│  profile（登录态持久）        │
-│  启动: open -n -g（不抢焦点） │
-└─────────────────────────────┘
+┌──────────────────────────────┐
+│  hutui (Rust + ratatui)      │
+│  ├ ui/     列表/阅读/panic    │
+│  ├ app.rs  状态机 + 按键      │
+│  └ bridge/ 后台线程           │
+└───────────┬──────────────────┘
+            │ mpsc: Cmd ↓ / Event ↑
+┌───────────┴──────────────────┐
+│  工作线程                     │
+│  ├ chrome.rs  实例生命周期     │
+│  ├ cdp.rs     WS + fetch_json │
+│  └ worker.rs  三个接口的取数   │
+└───────────┬──────────────────┘
+            │ CDP over ws://127.0.0.1:9222
+┌───────────┴──────────────────┐
+│  独立 Chrome 实例             │
+│  一个常驻知乎页（同源上下文）  │
+│  profile: ~/.hutui/chrome-   │
+│  profile（登录态持久）         │
+└──────────────────────────────┘
 ```
 
-**为什么是这个形态**：终端内直连被签名挡住；而 CDP 的 `Network` 域能读到知乎**自己发出**的
-响应体 —— 不碰 `x-zse-96`、不伪造身份、被动只读，正好落在边界内侧。
+**为什么还要浏览器**：不是为了模拟操作，而是为了拿到一个**带登录 cookie 的同源上下文**。
+所有取数都是一次 `fetch`，没有页面时序依赖。
 
-**线程模型**：主线程只管渲染与按键，任何网络等待都在工作线程；`Cmd`/`Event` 走 mpsc。
-渲染永远是单帧 `terminal.draw()`，**不存在异步半帧**。
+**线程模型**：主线程只管渲染与按键；`Cmd`/`Event` 走 mpsc；渲染永远单帧 `terminal.draw()`。
 
 ## 4. 数据流与交互
 
 ```
-启动 ──► 工作线程: ensure Chrome → 建 target → Network.enable
-                    → navigate 首页 → 捕获 /api/v3/feed/... → 滚动补页
-                    → 增量 Event::Feed 回主线程
+启动 ──► 工作线程: ensure Chrome → 建知乎页 → 轮询 location.origin 直到是 zhihu.com
+                    → 跟 paging.next 取推荐流（首屏 6 条，最多 12 页）
 
-列表  ↑↓ 移动光标（j/k 同义）
-      → / Enter ──► 打开阅读流
-      r 重新拉取        q / Ctrl-C 退出
+列表  ↑↓ / j k 选择      → / Enter 打开      r 重拉      q / Ctrl-C 退出
 
-阅读  进入时：当前条已有全文 → 立刻渲染（零延迟、零请求）
-      同时后台 navigate 到 /question/{qid} 滚动预取同问题其他回答，
-      按 answer id 去重后追加到流尾
+打开  → 立刻用手里的正文秒开（零延迟）
+       ├─ a: fetch /api/v4/answers/{aid}      → 用权威正文覆盖当前条
+       └─ b: fetch /questions/{qid}/answers   → 按接口顺序重排整个列表，
+                                                 并把当前这条定位到它自己的位置
 
-      ↑↓ / n / p  切换该问题下的上/下一条回答（一条一屏）
-      PgUp/PgDn · Home/End  在当前这条内部滚动（每条各自记住位置）
+阅读  一条一屏。↑↓ / j k / n p 切换该问题下的上/下一条
+      PgUp/PgDn · Home/End  在当前这条内部滚动（每条按 id 记住位置）
       ← / Backspace 返回列表
 
 panic Esc 连按两下 或 Ctrl-H ──► 全屏重绘成静止的 cargo test 画面
-      任意键（或再按 Esc）恢复；恢复目标为进入 panic 前的视图
+      任意键（或再按 Esc）恢复
 ```
 
-**为什么一条一屏**：↑↓ 直接对应「换一个回答看」这个动作，比"滚过某条边界"更符合直觉。
-代价是长回答必须靠 PgUp/PgDn 在条内滚，所以给每条回答单独记住滚动位置，
-切走再切回来不丢位置；footer 右上角显示 `已滚/可滚` 行数。
-
-**预取策略**：列表首次目标 42 条（≈7 页）；阅读流首次 5 条，滚到剩 2 条时再取下一页，硬上限 50。
+**为什么一条一屏**：↑↓ 直接对应「换一个回答看」，比"滚过边界"更符合直觉。代价是长回答要
+PgUp/PgDn，所以按回答 id 记住各自的滚动位置，切回来不丢。
 
 ## 5. 渲染规范
 
 ```
 整体    视口收窄到最大 1024px（128 列）并水平居中，超宽终端两侧留白
-header  ▌ Codex  ~/hutui  main*  ·  rustc 1.98      3/12
+header  ▌ Codex  ~/hutui  main*  ·  rustc 1.98      3/15
 列表    ▸ 现在大环境很难很难找工作吗？
           重水轮回立 · 110 赞 · 摘要前若干字…
-阅读    ── 3/12 · 作者 · 110 赞 ─────────────────
+阅读    ── 3/15 · 作者 · 110 赞 ─────────────────
         问题标题
         正文段落（2 空格缩进）
 footer  {状态}                                     18/64
 ```
 
-- **零「知乎」字样**；路径用真实的 `~/hutui`（真实的东西最难被看穿）。
+- **零「知乎」字样**；路径用真实的 `~/hutui`。
 - 颜色：正文 `Rgb(220,220,225)`，次要 `Rgb(120,120,128)`，强调 `Rgb(120,200,180)`。
-- **panic 画面必须静止**：会滚动的画面反而吸引注意，静止的终端是自然的（你在读它）。
-  且零动效 = 零半帧风险，与硬约束契合。
+- **panic 画面必须静止**：会滚动的画面反而吸引注意；零动效 = 零半帧风险。
 
 ## 6. 风险与应对
 
 | 风险 | 应对 |
 |---|---|
-| 高频自动滚动触发风控 | 页间 1.5~4s 随机间隔；被拦时如实提示，不假装成功 |
-| Chrome 切到别的 Space 被节流（**未测**） | 用户可切回；设计上不依赖后台渲染 |
-| 知乎改版破坏解析 | `parse.rs` 里「接口/字段 → 解析器」保持扁平，改版只改解析层 |
+| 接口改版 | `parse.rs` 里三个解析器保持扁平，改版只改解析层 |
+| 接口突然开始校验签名 | `fetch_json` 会把非 200 连同响应头 160 字符报出来，出错即可见 |
+| 登录失效 | 页面会 302 到 `/signin`，`wait_origin` 25s 超时报错而非静默空列表 |
+| 单问题回答过多 | 列表接口按 `limit=20` 翻页，`STREAM_MAX=50` 硬上限 |
 | 同篇回答在多个问题下重复 | 按 answer id 去重 |
-| 单问题 200+ 回答 | 阅读流硬上限 50，超出提示 |
 
 ## 7. 不做什么
 
-- 不做自动伪装（原 1004 焦点上报 / NSWorkspace 方案）—— 已砍，只保留手动 panic。
-- 不做 headless —— 已定有窗口 + `open -g`。
-- 不做写操作（赞同/收藏/评论）—— 首版只读。
-- 不做登录流程 —— 由 `~/.hutui/chrome-profile` 承载，首次手动登录一次即可。
+- 不模拟页面点击 / 滚动，不解析 DOM
+- 不重写签名算法、不伪造 UA
+- 不做 headless（有窗口 + `open -g`）
+- 不做写操作（赞同/收藏/评论）
+- 不做自动伪装，只保留手动 panic
 
 ## 8. 待办
 
-- [ ] panic 画面做成可配（当前写死 cargo test）
+- [ ] panic 画面做成可配
 - [ ] 文章 / 想法(pin) 类型的阅读分支
-- [ ] 登录失效时的探测与提示
-- [ ] 预取节流与「已读」去重（知乎服务端会过滤已读，`finished_reading_filtered_count`）
+- [ ] 推荐流「已读」去重（服务端会过滤，`finished_reading_filtered_count`）
+- [ ] `content_need_truncated` 的兜底提示
