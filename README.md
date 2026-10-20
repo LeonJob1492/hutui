@@ -264,7 +264,6 @@ docs/screenshots/    README 用的界面截图
 
 ## 更多文档
 
-- `AGENTS.md` —— 项目规范、已核验的硬约束、决策台账
 - `docs/design.md` —— 设计文档（数据链路、架构、实测结论，实现的唯一事实源）
 
 ## License
