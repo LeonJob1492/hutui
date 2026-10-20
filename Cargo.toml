@@ -1,9 +1,12 @@
 [package]
 name = "hutui"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 rust-version = "1.80"
 description = "终端里的 Codex 皮阅读器"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/LeonJob1492/hutui"
+readme = "README.md"
 
 [[bin]]
 name = "hutui"

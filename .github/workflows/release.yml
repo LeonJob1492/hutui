@@ -1,0 +1,51 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  macos-universal:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 版本号与 tag 必须一致
+        run: |
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          echo "Cargo.toml version = $ver"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ] && [ "v$ver" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 与 Cargo.toml 的 $ver 不一致"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: 构建两个架构
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin
+          cargo build --release --locked --target x86_64-apple-darwin
+
+      - name: 合成通用二进制并打包
+        run: |
+          lipo -create -output hutui \
+            target/aarch64-apple-darwin/release/hutui \
+            target/x86_64-apple-darwin/release/hutui
+          lipo -info hutui
+          tar czf hutui-universal-apple-darwin.tar.gz hutui
+          shasum -a 256 hutui-universal-apple-darwin.tar.gz > hutui-universal-apple-darwin.tar.gz.sha256
+          cat hutui-universal-apple-darwin.tar.gz.sha256
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            hutui-universal-apple-darwin.tar.gz
+            hutui-universal-apple-darwin.tar.gz.sha256
+          generate_release_notes: true
+          fail_on_unmatched_files: true
